@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -9,8 +11,111 @@
 #include <math.h>
 
 #include "pfpl_f32_noa_cpu_api.hpp"
-#include "rw.h"
 #include "mpi.h"
+
+static const char* INPUT_DIR = "/public/share/acnnprvuzd/data/sdrbench/NYX";
+static const char* OUTPUT_DIR = "/public/share/acnnprvuzd/data/out";
+
+static int ensure_dir(const char* dir)
+{
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        if (S_ISDIR(st.st_mode))
+            return 0;
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (mkdir(dir, 0777) == 0)
+        return 0;
+    if (errno == EEXIST)
+        return 0;
+    return -1;
+}
+
+static void build_tmp_filename(char* filename, size_t filename_len, const char* prefix, int world_rank)
+{
+    const char* jobid = getenv("SLURM_JOB_ID");
+    if (jobid == NULL || jobid[0] == '\0')
+        jobid = getenv("PBS_JOBID");
+    if (jobid == NULL || jobid[0] == '\0')
+        jobid = "nojid";
+    snprintf(filename, filename_len, "%s/%s_%s_%d_%d_%ld.out",
+             OUTPUT_DIR, prefix, jobid, world_rank, (int)getpid(), (long)time(NULL));
+}
+
+static int write_all_bytes(const unsigned char* bytes, size_t byte_length, const char* filename)
+{
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    size_t written = 0;
+    if (fd < 0)
+        return -1;
+    while (written < byte_length) {
+        ssize_t count = write(fd, bytes + written, byte_length - written);
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        if (count == 0) {
+            close(fd);
+            errno = EIO;
+            return -1;
+        }
+        written += (size_t)count;
+    }
+    if (close(fd) != 0)
+        return -1;
+    return 0;
+}
+
+static unsigned char* read_all_bytes(const char* filename, size_t* byte_length)
+{
+    int fd = open(filename, O_RDONLY);
+    struct stat st;
+    unsigned char* buf;
+    size_t total = 0;
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
+    if (st.st_size < 0) {
+        close(fd);
+        errno = EIO;
+        return NULL;
+    }
+    *byte_length = (size_t)st.st_size;
+    buf = (unsigned char*)malloc((*byte_length == 0) ? 1 : *byte_length);
+    if (buf == NULL) {
+        close(fd);
+        errno = ENOMEM;
+        return NULL;
+    }
+    while (total < *byte_length) {
+        ssize_t count = read(fd, buf + total, *byte_length - total);
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        if (count == 0) {
+            free(buf);
+            close(fd);
+            errno = EIO;
+            return NULL;
+        }
+        total += (size_t)count;
+    }
+    if (close(fd) != 0) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
 
 
 int main(int argc, char * argv[])
@@ -94,8 +199,8 @@ int main(int argc, char * argv[])
     double scale_rel_bound[12] ={1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3};
 
     int nyx_num_vars = 6;
-    char nyx_file[6][50] = {"temperature.f32", "velocity_x.f32", "velocity_y.f32",
-                            "velocity_z.f32", "dark_matter_density.f32", "baryon_density.f32"};
+    char nyx_file[6][50] = {"temperature.f32","velocity_y.f32",
+                            "velocity_z.f32", "velocity_x.f32"};
     double nyx_rel_bound[7] = {1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3};
 
     int aramco_num_vars = 50;
@@ -138,7 +243,7 @@ int main(int argc, char * argv[])
     size_t compressed_size[100];
     size_t original_size[100];
 
-    char folder[256] = "/public/share/acnnprvuzd/data/sdrbench/Hurricane";
+    const char *folder = INPUT_DIR;
     char filename[512];
     char zip_filename[512];
     size_t inSize;
@@ -157,7 +262,7 @@ int main(int argc, char * argv[])
     if (cfgFile != NULL) {
         threshold = (float)atof(cfgFile);
     }
-
+    num_vars = 4;
     for(int i=0; i<num_vars; i++){
         sprintf(filename, "%s/%s", folder, file[i]);
 
@@ -205,15 +310,22 @@ int main(int argc, char * argv[])
         free(bytesOut);
     }
 
-    struct stat st = {0};
-    if (stat("/public/share/acnnprvuzd/data/out", &st) == -1) {
-        mkdir("/public/share/acnnprvuzd/data/out", 0777);
+    if (ensure_dir(OUTPUT_DIR) != 0) {
+        printf("ERROR! Failed to prepare output dir %s: %s\n", OUTPUT_DIR, strerror(errno));
+        free(compressed_output);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
     }
-    sprintf(zip_filename, "%s/pfpl_%d_%d.out", "/public/share/acnnprvuzd/data/out", folder_index, rand());
+    build_tmp_filename(zip_filename, sizeof(zip_filename), "pfpl", folder_index);
 
     MPI_Barrier(MPI_COMM_WORLD);
     if(world_rank == 0) start = MPI_Wtime();
-    writeByteData(compressed_output, total_size, zip_filename, &status);
+    if (write_all_bytes(compressed_output, total_size, zip_filename) != 0) {
+        printf("ERROR! Failed to write compressed file %s: %s\n", zip_filename, strerror(errno));
+        free(compressed_output);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
     MPI_Barrier(MPI_COMM_WORLD);
     if(world_rank == 0){
         end = MPI_Wtime();
@@ -223,9 +335,14 @@ int main(int argc, char * argv[])
 
     MPI_Barrier(MPI_COMM_WORLD);
     if(world_rank == 0) start = MPI_Wtime();
-    compressed_output = readByteData(zip_filename, &inSize, &status);
+    compressed_output = read_all_bytes(zip_filename, &inSize);
+    if (compressed_output == NULL) {
+        printf("ERROR! Failed to read compressed file %s: %s\n", zip_filename, strerror(errno));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
     if (inSize != total_size) {
-        printf("ERROR! Broken file : %s\n", zip_filename);
+        printf("ERROR! Broken file : %s (expected %zu bytes, got %zu bytes)\n", zip_filename, total_size, inSize);
     } else {
         remove(zip_filename);
     }
