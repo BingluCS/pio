@@ -74,7 +74,7 @@ def run_zfp(shape, data_type, input_file, e, mode = 'REL', nums = 1):
     decompressed_file = input_file + ".zfp.out"
     # os.environ["OMP_NUM_THREADS"] =  str(nums)
     cmd = [
-        "../ZFP/bin/zfp", data_type_para,
+        "../zfp/bin/zfp", data_type_para,
         "-i", input_file,
         "-z", compressed_file,
         "-o", decompressed_file, 
@@ -356,7 +356,7 @@ def run_tthresh_para(cmp, shape, data_type, input_file, e, mode = 'ABS', nums = 
         '-s', *[str(s) for s in (shape)], t,
        "-e", f"{float(e):.10f}".rstrip('0').rstrip('.'),
     ] 
-    print(cmd)
+    # print(cmd)
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return compressed_file, decompressed_file, result
 
@@ -653,10 +653,10 @@ def run_compressor(shape, data_type, data_path, compressor):
 
 
 def test_compressor(shape, data_type, data_path):
-    # run_compressor(shape, data_type, data_path, 'ZFP')
-    # run_compressor(shape, data_type, data_path, 'PFPL')
-    # run_compressor(shape, data_type, data_path, 'SZo')
-    # run_compressor(shape, data_type, data_path, 'SZ3')
+    run_compressor(shape, data_type, data_path, 'ZFP')
+    run_compressor(shape, data_type, data_path, 'PFPL')
+    run_compressor(shape, data_type, data_path, 'SZo')
+    run_compressor(shape, data_type, data_path, 'SZ3')
     run_compressor(shape, data_type, data_path, 'SPERR')
     run_compressor(shape, data_type, data_path, 'tthresh')
 
