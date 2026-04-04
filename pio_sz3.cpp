@@ -9,14 +9,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef OMPI_SKIP_MPICXX
-#define OMPI_SKIP_MPICXX 1
-#endif
-
-#ifndef MPICH_SKIP_MPICXX
-#define MPICH_SKIP_MPICXX 1
-#endif
-
 #include "SZ3/api/sz.hpp"
 #include "rw.h"
 #include "mpi.h"
