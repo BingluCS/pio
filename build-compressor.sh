@@ -53,7 +53,8 @@ build_tthresh() {
     cd tthresh
     mkdir build
     cd build
-     cmake -DCMAKE_BUILD_TYPE=Release ..
+    cmake -DCMAKE_BUILD_TYPE=Release ..
+	make -j
     cd ../..
 }
 case "$TARGET" in
