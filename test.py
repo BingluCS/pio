@@ -347,16 +347,16 @@ def run_tthresh_para(cmp, shape, data_type, input_file, e, mode = 'ABS', nums = 
     os.environ["OMP_NUM_THREADS"] =  str(nums)
     os.environ["OMP_PROC_BIND"] = "close"
     cpus = f"0-{nums-1}" 
-    t = '1' if len(shape) == 2 else ''
     cmp_dir = f"../{cmp}/build/tthresh"
     cmd = [
         "taskset", "-c", cpus,
         cmp_dir, "-t", data_type_para,
         "-i", input_file, '-c', compressed_file, '-o', decompressed_file,
-        '-s', *[str(s) for s in (shape)], t,
        "-e", f"{float(e):.10f}".rstrip('0').rstrip('.'),
+        '-s', *[str(s) for s in (shape)],
     ] 
-    # print(cmd)
+    if len(shape) == 2:
+        cmd += ['1']
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return compressed_file, decompressed_file, result
 
