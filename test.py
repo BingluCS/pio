@@ -360,6 +360,42 @@ def run_tthresh_para(cmp, shape, data_type, input_file, e, mode = 'ABS', nums = 
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return compressed_file, decompressed_file, result
 
+def run_mgard_para(cmp, shape, data_type, input_file, e, mode = 'abs', nums = 1):
+    # shape_str = 'x'.join(map(str, shape))
+    data_type_para = '-f'
+    if(data_type == "float"):
+        data_type_para = "s"
+    else:
+        data_type_para = "d"
+    compressed_file = input_file + ".mgard"
+    decompressed_file = input_file + ".mgard.out"
+    os.environ["OMP_NUM_THREADS"] =  str(nums)
+    os.environ["OMP_PROC_BIND"] = "close"
+    cpus = f"0-{nums-1}" 
+    t = 'serial' if nums == 1 else 'openmp'
+    cmp_dir = f"../{cmp}/build-openmp-cpu/mgard/bin/mgard-x"
+    cmd = [
+        "taskset", "-c", cpus,
+        cmp_dir, "-z", '-dt', data_type_para,
+        "-i", input_file, "-o", compressed_file,
+        '-dim', str(len(shape)), *[str(s) for s in (shape)][::-1],
+       "-em", mode, '-e',str(e),
+       '-s', 'inf', '-d', t,
+       '-v', '2',
+       '-l', 'huffman-zstd',
+    ] 
+    cmp_result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    decmd = [
+        "taskset", "-c", cpus,
+        cmp_dir, "-x",
+        "-i", compressed_file, 
+        "-o", decompressed_file, '-d', t, '-v', '2'
+    ] 
+    dec_result = subprocess.run(decmd, check=True, capture_output=True, text=True)
+    print(cmp_result.stdout,dec_result.stdout )
+    return compressed_file, decompressed_file, [cmp_result, dec_result]
+
+
 
 def run_compressor(shape, data_type, data_path, compressor):
     global omp_nums
@@ -426,6 +462,8 @@ def run_compressor(shape, data_type, data_path, compressor):
         #     continue
         if compressor == 'SZ3' and (dataset == 'Hurricane' or dataset == 'SCALE'):
             omp_nums = [1,2,4,8,16,32]
+        else :
+            omp_nums = [1,2,4,8,16,32,64]
         for nums in omp_nums:
             print(f"Processing file: {input_file}, threads: {nums}")
             temp_size = [dataset, filename, compressor, nums] if turn_omp is True else [dataset, filename, compressor]
@@ -595,6 +633,21 @@ def run_compressor(shape, data_type, data_path, compressor):
                     # temp_rmse += [rmse]
                     temp_nrmse += [nrmse]
                     temp_psnr += [psnr]
+                elif compressor == 'MGARD':
+                    compressed_file, decompressed_file, [cmp_result, dec_result] = run_mgard_para('MGARD',shape, data_type, input_file,  e, 'abs', nums)
+                    cmp_th = float(re.search(r"High-level compression time: .*?(\d+\.\d+)", cmp_result.stdout).group(1))
+                    dec_th = float(re.search(r"High-level decompression time: .*?(\d+\.\d+)", dec_result.stdout).group(1))
+                    cmp_size = os.path.getsize(compressed_file)
+                    maxe, maxre, rmse, nrmse, psnr = compute_psnr(input_file, decompressed_file, ddtype, shape)
+                    temp_cmpth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(cmp_th)]
+                    temp_decth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(dec_th)]
+                    temp_ratio += [byte_num * data_num / cmp_size]
+                    temp_size += [cmp_size]
+                    temp_maxe += [maxe]
+                    temp_maxre += [maxre]
+                    # temp_rmse += [rmse]
+                    temp_nrmse += [nrmse]
+                    temp_psnr += [psnr]
                 else:
                     print(f"Compressor {compressor} not supported.")
                     sys.exit(1)
@@ -631,9 +684,9 @@ def run_compressor(shape, data_type, data_path, compressor):
     for file_csv in [ratio_csv, comth_csv, decth_csv, cmp_size_csv, psnr_csv, maxre_csv, maxe_csv, nrmse_csv]:
         if not os.path.exists(file_csv):
             continue
-        df = pd.read_csv(file_csv)
-        df = df[(df['dataset'] != dataset) | (df['type'] != compressor)]
-        df.to_csv(file_csv, index=False)
+        #df = pd.read_csv(file_csv)
+        #df = df[(df['dataset'] != dataset) | (df['type'] != compressor)]
+        #df.to_csv(file_csv, index=False)
 
     w_mode = 'a'
     hearder_mode = (not os.path.exists(ratio_csv)) or w_mode == 'w'
@@ -653,12 +706,12 @@ def run_compressor(shape, data_type, data_path, compressor):
 
 
 def test_compressor(shape, data_type, data_path):
-    run_compressor(shape, data_type, data_path, 'ZFP')
-    run_compressor(shape, data_type, data_path, 'PFPL')
-    run_compressor(shape, data_type, data_path, 'SZo')
-    run_compressor(shape, data_type, data_path, 'SZ3')
-    run_compressor(shape, data_type, data_path, 'SPERR')
-    run_compressor(shape, data_type, data_path, 'tthresh')
+    #run_compressor(shape, data_type, data_path, 'ZFP')
+    #run_compressor(shape, data_type, data_path, 'PFPL')
+    #run_compressor(shape, data_type, data_path, 'SZo')
+    #run_compressor(shape, data_type, data_path, 'SZ3')
+    #run_compressor(shape, data_type, data_path, 'SPERR')
+    run_compressor(shape, data_type, data_path, 'MGARD')
 
 if __name__ == "__main__":
     # input_file = sys.argv[2]
