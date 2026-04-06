@@ -470,7 +470,6 @@ def run_compressor(shape, data_type, data_path, compressor):
             omp_nums = [1,2,4,8,16,32]
         else :
             omp_nums = [1,2,4,8,16,32,64]
-        omp_nums =[2]
         for nums in omp_nums:
             print(f"Processing file: {input_file}, threads: {nums}")
             temp_size = [dataset, filename, compressor, nums] if turn_omp is True else [dataset, filename, compressor]
