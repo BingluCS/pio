@@ -384,15 +384,21 @@ def run_mgard_para(cmp, shape, data_type, input_file, e, mode = 'abs', nums = 1)
        '-v', '2',
        '-l', 'huffman-zstd',
     ] 
-    cmp_result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    decmd = [
-        "taskset", "-c", cpus,
-        cmp_dir, "-x",
-        "-i", compressed_file, 
-        "-o", decompressed_file, '-d', t, '-v', '2'
-    ] 
-    dec_result = subprocess.run(decmd, check=True, capture_output=True, text=True)
-    print(cmp_result.stdout,dec_result.stdout )
+    cmp_result = subprocess.run(cmd, capture_output=True, text=True)
+    print(t)
+    if cmp_result.returncode != 0:
+        print("fail")
+        return "fail", "fail", [None,None]
+    else:
+        decmd = [
+            "taskset", "-c", cpus,
+            cmp_dir, "-x",
+            "-i", compressed_file, 
+            "-o", decompressed_file, '-d', t, '-v', '2'
+        ] 
+        dec_result = subprocess.run(decmd, check=True, capture_output=True, text=True)
+    
+
     return compressed_file, decompressed_file, [cmp_result, dec_result]
 
 
@@ -464,6 +470,7 @@ def run_compressor(shape, data_type, data_path, compressor):
             omp_nums = [1,2,4,8,16,32]
         else :
             omp_nums = [1,2,4,8,16,32,64]
+        omp_nums =[2]
         for nums in omp_nums:
             print(f"Processing file: {input_file}, threads: {nums}")
             temp_size = [dataset, filename, compressor, nums] if turn_omp is True else [dataset, filename, compressor]
@@ -635,24 +642,36 @@ def run_compressor(shape, data_type, data_path, compressor):
                     temp_psnr += [psnr]
                 elif compressor == 'MGARD':
                     compressed_file, decompressed_file, [cmp_result, dec_result] = run_mgard_para('MGARD',shape, data_type, input_file,  e, 'abs', nums)
-                    cmp_th = float(re.search(r"High-level compression time: .*?(\d+\.\d+)", cmp_result.stdout).group(1))
-                    dec_th = float(re.search(r"High-level decompression time: .*?(\d+\.\d+)", dec_result.stdout).group(1))
-                    cmp_size = os.path.getsize(compressed_file)
-                    maxe, maxre, rmse, nrmse, psnr = compute_psnr(input_file, decompressed_file, ddtype, shape)
-                    temp_cmpth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(cmp_th)]
-                    temp_decth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(dec_th)]
-                    temp_ratio += [byte_num * data_num / cmp_size]
-                    temp_size += [cmp_size]
-                    temp_maxe += [maxe]
-                    temp_maxre += [maxre]
-                    # temp_rmse += [rmse]
-                    temp_nrmse += [nrmse]
-                    temp_psnr += [psnr]
+                    if compressed_file == "fail":
+                        temp_cmpth += [0]
+                        temp_decth += [0]
+                        temp_ratio += [0]
+                        temp_size += [0]
+                        temp_maxe += [0]
+                        temp_maxre += [0]
+                        # temp_rmse += [rmse]
+                        temp_nrmse += [0]
+                        temp_psnr += [0]
+                    else:
+                        cmp_th = float(re.search(r"High-level compression time: .*?(\d+\.\d+)", cmp_result.stdout).group(1))
+                        dec_th = float(re.search(r"High-level decompression time: .*?(\d+\.\d+)", dec_result.stdout).group(1))
+                        cmp_size = os.path.getsize(compressed_file)
+                        maxe, maxre, rmse, nrmse, psnr = compute_psnr(input_file, decompressed_file, ddtype, shape)
+                        temp_cmpth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(cmp_th)]
+                        temp_decth += [byte_num * data_num / 1024 / 1024 / 1024 /  float(dec_th)]
+                        temp_ratio += [byte_num * data_num / cmp_size]
+                        temp_size += [cmp_size]
+                        temp_maxe += [maxe]
+                        temp_maxre += [maxre]
+                        # temp_rmse += [rmse]
+                        temp_nrmse += [nrmse]
+                        temp_psnr += [psnr]
                 else:
                     print(f"Compressor {compressor} not supported.")
                     sys.exit(1)
-            os.remove(compressed_file)
-            os.remove(decompressed_file)
+            if compressed_file !='fail':
+                os.remove(compressed_file)
+                os.remove(decompressed_file)
             odata_ratio.append(temp_ratio)
             odata_cmpth.append(temp_cmpth)
             odata_decth.append(temp_decth)
