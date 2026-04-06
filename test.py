@@ -385,7 +385,7 @@ def run_mgard_para(cmp, shape, data_type, input_file, e, mode = 'abs', nums = 1)
        '-l', 'huffman-zstd',
     ] 
     cmp_result = subprocess.run(cmd, capture_output=True, text=True)
-    print(t)
+    # print(t)
     if cmp_result.returncode != 0:
         print("fail")
         return "fail", "fail", [None,None]
