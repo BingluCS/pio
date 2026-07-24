@@ -25,13 +25,15 @@ cd /home/lb/compressor/pio
 ### SZo
 
 ```bash
-mpicxx -O3 pio_szo.cpp -o pio_szo \
+mpicxx -O3 -fvisibility=hidden pio_szo.cpp \
+  /home/lb/compressor/SZo/include/SZo/encoder/zfse/*.c \
   -I/home/lb/compressor/SZo/build/include \
-  -L/home/lb/compressor/SZo/build/lib64 \
-  -std=c++17 -lzstd -mavx2 -mfma
+  -std=c++17 -lzstd -mavx2 -mfma -o pio_szo
 ```
 
-SZo 的 RLE+FSE 后端使用 `libzstd` 中的 FSE 符号，因此必须保留 `-lzstd`。如果链接时出现 `undefined reference to FSE_*`，应确认系统的 `libzstd-dev` 可用，并把 `-lzstd` 放在源文件/目标文件之后。
+SZo 自带 FSE 源码，位于 `include/SZo/encoder/zfse`。上面的单条 `mpicxx` 命令会同时编译 PIO 和内建 FSE；这样 `FSE_*` 使用 SZo 内建版本，而不是意外解析到系统 `libzstd` 导出的内部 FSE 符号。`-fvisibility=hidden` 将内建 FSE 符号限制在当前可执行文件内。
+
+`-lzstd` 仍然必须保留，因为 SZo 后端还使用 `ZSTD_*` 完成最终的 Zstd 包装。它不再负责提供 FSE。链接参数应放在源码和 FSE 目标文件之后。
 
 #### SZo on ARM with SVE2
 
@@ -47,19 +49,19 @@ cmake --build build -j
 
 ```bash
 cd /home/lb/compressor/pio
-mpicxx -O3 pio_szo.cpp -o pio_szo \
+mpicxx -O3 -march=armv8.6-a+sve2 -fvisibility=hidden pio_szo.cpp \
+  /home/lb/compressor/SZo/include/SZo/encoder/zfse/*.c \
   -I/home/lb/compressor/SZo/build/include \
-  -L/home/lb/compressor/SZo/build/lib64 \
-  -std=c++17 -lzstd -march=armv8.6-a+sve2
+  -std=c++17 -lzstd -o pio_szo
 ```
 
 ARM 构建不要使用 x86 专用的 `-mavx2 -mfma`。如果程序只在编译它的同一台机器上运行，也可以让编译器按本机 CPU 自动选择指令集：
 
 ```bash
-mpicxx -O3 pio_szo.cpp -o pio_szo \
+mpicxx -O3 -march=native -fvisibility=hidden pio_szo.cpp \
+  /home/lb/compressor/SZo/include/SZo/encoder/zfse/*.c \
   -I/home/lb/compressor/SZo/build/include \
-  -L/home/lb/compressor/SZo/build/lib64 \
-  -std=c++17 -lzstd -march=native
+  -std=c++17 -lzstd -o pio_szo
 ```
 
 只有当本机 CPU 支持 SVE2 时，`-march=native` 才会定义 `__ARM_FEATURE_SVE2` 并启用 SZo 的 SVE2 代码。可以检查编译器是否启用了该宏：
