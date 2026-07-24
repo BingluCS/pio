@@ -1,8 +1,8 @@
 #include <stdio.h>
+
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -14,6 +14,7 @@
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <algorithm>
 #include <exception>
@@ -27,22 +28,19 @@
 #define MPICH_SKIP_MPICXX 1
 #endif
 
-#include "SZ3/api/sz.hpp"
+#include "SZo/api/sz.hpp"
 #include "mpi.h"
 
 static int ensure_dir(const char* dir)
 {
     struct stat st;
     if (stat(dir, &st) == 0) {
-        if (S_ISDIR(st.st_mode))
-            return 0;
+        if (S_ISDIR(st.st_mode)) return 0;
         errno = ENOTDIR;
         return -1;
     }
-    if (mkdir(dir, 0777) == 0)
-        return 0;
-    if (errno == EEXIST)
-        return 0;
+    if (mkdir(dir, 0777) == 0) return 0;
+    if (errno == EEXIST) return 0;
     return -1;
 }
 
@@ -82,10 +80,7 @@ static unsigned char* readFloatData(const char *srcFilePath, size_t *nbEle)
 {
     size_t byteSize = 0;
     unsigned char *data = readBytes(srcFilePath, &byteSize);
-    if (data == NULL || byteSize % sizeof(float) != 0) {
-        free(data);
-        return NULL;
-    }
+    if (data == NULL) return NULL;
     *nbEle = byteSize / sizeof(float);
     return data;
 }
@@ -104,8 +99,8 @@ static double dataRange(const float *data, size_t nbEle)
 }
 
 void usage() {
-    printf("Test case: pio_sz3 -e error_bound -d dataset_name -i list_file -o output_dir -n nums [-z [parts]] [-1 r1 | -2 r1 r2 | -3 r1 r2 r3 | -4 r1 r2 r3 r4]\n");
-    printf("Example: pio_sz3 -e 1e-3 -d nyx -i /path/to/list.txt -o /path/to/out -n 4 -z 4 -3 r1 r2 r3\n");
+    printf("Test case: pio_szo -e error_bound -d dataset_name -i list_file -o output_dir -n nums [-z [parts]] [-1 r1 | -2 r1 r2 | -3 r1 r2 r3 | -4 r1 r2 r3 r4]\n");
+    printf("Example: pio_szo -e 1e-3 -d nyx -i /path/to/list.txt -o /path/to/out -n 4 -z 4 -3 r1 r2 r3\n");
 }
 int main(int argc, char * argv[])
 {
@@ -115,6 +110,7 @@ int main(int argc, char * argv[])
     int world_rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
+    srand(time(0));
     if(argc < 6)
     {
         if (world_rank == 0) usage();
@@ -127,8 +123,8 @@ int main(int argc, char * argv[])
     size_t r1 = 1;
 
     double eb = 1e-3;
-    const char *dataset_name = NULL;
-    const char *folder = NULL;
+    char *dataset_name = NULL;
+    char *folder = NULL;
     const char *output_dir = "./out";
     int num_vars = 0;
     bool split_z = false;
@@ -185,24 +181,16 @@ int main(int argc, char * argv[])
                 break;
         }
     }
+
     if (dataset_name == NULL || folder == NULL || num_vars <= 0) {
-        if (world_rank == 0) {
-            printf("ERROR: Missing required arguments: -d (dataset_name), -i (list file), or -n (num_vars).\n");
-            usage();
-        }
-        MPI_Finalize();
-        return 1;
-    }
-    if (split_z && (r4 != 1 || r3 <= 1 || z_parts < 2 || z_parts > r3)) {
-        if (world_rank == 0) printf("ERROR: -z currently supports only 3D data with z dimension > 1 and 2 <= parts <= z dimension.\n");
-        MPI_Finalize();
+        printf("ERROR: Missing required arguments: -d (dataset_name), -i (list file), or -n (num_vars).\n");
+        usage();
         return 1;
     }
 
     std::ifstream list_file(folder);
     if (!list_file.good()) {
-        if (world_rank == 0) printf("ERROR! Input information folder %s does not exist or is not accessible.\n", folder);
-        MPI_Finalize();
+        printf("ERROR! Input information folder %s does not exist or is not accessible.\n", folder);
         return 1;
     }
 
@@ -228,26 +216,39 @@ int main(int argc, char * argv[])
     }
     list_file.close();
 
+
     if (world_rank == 0) printf("Start parallel compressing ... \n");
     if (world_rank == 0) printf("size: %d\n", world_size);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    size_t compressed_size[100] = {0};
-    size_t original_size[100] = {0};
+    size_t compressed_size[100];
+    size_t original_size[100];
+
     size_t total_original_size = 0;
     size_t total_size = 0;
     std::vector<unsigned char> compressed_output;
+    unsigned char* cmpArr[200] = {nullptr};   // per-variable compressed bytes; concatenated into compressed_output AFTER the timed loop
+    size_t cmpArrSize[200] = {0};
 
     float *dataIn;
+
+    SZo::Config conf(r4, r3, r2, r1);
+    conf.relErrorBound = eb;
+    conf.cmprAlgo = SZo::ALGO_INTERP_LORENZO;
+    if (split_z && (r4 != 1 || r3 <= 1 || z_parts < 2 || z_parts > r3)) {
+        if (world_rank == 0) {
+            printf("ERROR: -z currently supports only 3D data with z dimension > 1 and 2 <= parts <= z dimension.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
     const size_t active_parts = split_z ? z_parts : 1;
     if (num_vars * active_parts > 200) {
         if (world_rank == 0) printf("ERROR: num_vars * z parts must be <= 200.\n");
         MPI_Finalize();
         return 1;
     }
-    std::vector<size_t> part_compressed_size(num_vars * active_parts, 0);
-    std::vector<char*> part_output(num_vars * active_parts, NULL);
     std::vector<size_t> z_offsets(active_parts + 1, 0);
     for (size_t p = 0; p <= active_parts; p++) {
         z_offsets[p] = split_z ? (r3 * p / active_parts) : (p == 0 ? 0 : r3);
@@ -257,26 +258,28 @@ int main(int argc, char * argv[])
         for (size_t p = 0; p < active_parts; p++) printf(" %zu", z_offsets[p + 1] - z_offsets[p]);
         printf("\n");
     }
-
-    SZ3::Config conf(r4, r3, r2, r1);
-    conf.cmprAlgo = SZ3::ALGO_INTERP_LORENZO;
-    conf.relErrorBound = eb;
     auto make_slab_conf = [&](size_t slab_z) {
-        SZ3::Config slab_conf = conf;
+        SZo::Config slab_conf = conf;
         size_t slab_dims[4] = {r4, slab_z, r2, r1};
         slab_conf.setDims(slab_dims, slab_dims + 4);
+        slab_conf.relErrorBound = eb;
         return slab_conf;
     };
-    size_t cmpBufferCap = SZ3::SZ_compress_size_bound<float>(conf);
+    size_t cmpBufferCap = SZo::SZ_compress_size_bound<float>(conf);
     if (split_z) {
         cmpBufferCap = 0;
         for (size_t p = 0; p < active_parts; p++) {
-            SZ3::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-            cmpBufferCap = std::max(cmpBufferCap, SZ3::SZ_compress_size_bound<float>(slab_conf));
+            SZo::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
+            cmpBufferCap = std::max(cmpBufferCap, SZo::SZ_compress_size_bound<float>(slab_conf));
         }
     }
-    for (size_t idx = 0; idx < part_output.size(); idx++) {
-        part_output[idx] = new char[cmpBufferCap];
+    // One full-capacity output buffer per variable (two per variable for -z), allocated up front.
+    // The compress loop writes straight into its own buffer -> zero copy inside the timed region.
+    // Only the actual compressed bytes (~MB) are ever touched, so the big reservations stay virtual.
+    for (int k = 0; k < num_vars; k++) {
+        for (size_t p = 0; p < active_parts; p++) {
+            cmpArr[k * active_parts + p] = new unsigned char[cmpBufferCap];
+        }
     }
 
     double start, end;
@@ -291,7 +294,9 @@ int main(int argc, char * argv[])
     size_t nbEle;
     size_t expected_nbEle = r1 * r2 * r3 * r4;
     for(int i = 0; i < num_vars; i++) {
+        // read original data
         std::string filename = input_dir + "/" + file[i];
+        conf.relErrorBound = eb;
         if(world_rank == 0){
             start = MPI_Wtime();
             dataIn = reinterpret_cast<float*>(readFloatData(filename.c_str(), &nbEle));
@@ -313,17 +318,18 @@ int main(int argc, char * argv[])
         else{
             MPI_Bcast(&nbEle, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             dataIn = (float *) malloc(nbEle * sizeof(float));
+            #if defined(__linux__)
+            {   // hint THP for this large hot array (works under madvise mode; noop if unsupported)
+                uintptr_t _mb = (uintptr_t)(dataIn) & ~(uintptr_t)4095;
+                madvise((void *)_mb, (nbEle * sizeof(float)) + ((uintptr_t)(dataIn) - _mb), MADV_HUGEPAGE);
+            }
+            #endif
+
             if (dataIn == NULL) {
                 printf("ERROR! Failed to allocate input buffer on rank %d\n", world_rank);
                 MPI_Abort(MPI_COMM_WORLD, 1);
                 return 1;
             }
-#if defined(__linux__)
-            uintptr_t pageBase = reinterpret_cast<uintptr_t>(dataIn) & ~static_cast<uintptr_t>(4095);
-            madvise(reinterpret_cast<void *>(pageBase),
-                    nbEle * sizeof(float) + (reinterpret_cast<uintptr_t>(dataIn) - pageBase),
-                    MADV_HUGEPAGE);
-#endif
             MPI_Bcast(dataIn, nbEle, MPI_FLOAT, 0, MPI_COMM_WORLD);
         }
         MPI_Barrier(MPI_COMM_WORLD);
@@ -332,18 +338,16 @@ int main(int argc, char * argv[])
             costReadOri += end - start;
         }
 
+        // accumulate original size for compression ratio calculation
         original_size[i] = nbEle * sizeof(float);
         total_original_size += original_size[i];
 
+        double absErrorBound = 0.0;
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0) start = MPI_Wtime();
-        double absErrorBound = 0.0;
-        if(world_rank == 0) {
-            absErrorBound = eb * dataRange(dataIn, nbEle);
-            if (absErrorBound <= 0.0) absErrorBound = eb;
-        }
+        if(world_rank == 0) absErrorBound = eb * dataRange(dataIn, nbEle);
         MPI_Bcast(&absErrorBound, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        conf.errorBoundMode = SZ3::EB_ABS;
+        conf.errorBoundMode = SZo::EB_ABS;
         conf.absErrorBound = absErrorBound;
         conf.relErrorBound = eb;
         MPI_Barrier(MPI_COMM_WORLD);
@@ -352,29 +356,30 @@ int main(int argc, char * argv[])
             costBoundPrep += end - start;
         }
 
+        // compress data
         if(world_rank == 0) start = MPI_Wtime();
         double localCompStart = MPI_Wtime();
         try {
-            compressed_size[i] = 0;
             if (split_z) {
                 const size_t xy = r1 * r2;
+                compressed_size[i] = 0;
                 for (size_t p = 0; p < active_parts; p++) {
-                    const size_t idx = i * active_parts + p;
-                    SZ3::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-                    slab_conf.errorBoundMode = SZ3::EB_ABS;
+                    SZo::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
+                    slab_conf.errorBoundMode = SZo::EB_ABS;
                     slab_conf.absErrorBound = absErrorBound;
                     slab_conf.relErrorBound = eb;
-                    part_compressed_size[idx] = SZ_compress<float>(
-                        slab_conf, dataIn + z_offsets[p] * xy, part_output[idx], cmpBufferCap);
-                    compressed_size[i] += part_compressed_size[idx];
+                    const size_t idx = i * active_parts + p;
+                    const size_t slab_size = SZ_compress<float>(
+                        slab_conf, dataIn + z_offsets[p] * xy, reinterpret_cast<char*>(cmpArr[idx]), cmpBufferCap);
+                    cmpArrSize[idx] = slab_size;
+                    compressed_size[i] += slab_size;
                 }
             } else {
-                const size_t idx = i;
-                part_compressed_size[idx] = SZ_compress<float>(conf, dataIn, part_output[idx], cmpBufferCap);
-                compressed_size[i] = part_compressed_size[idx];
+                compressed_size[i] = SZ_compress<float>(conf, dataIn, reinterpret_cast<char*>(cmpArr[i]), cmpBufferCap);
+                cmpArrSize[i] = compressed_size[i];
             }
         } catch (const std::exception &e) {
-            printf("ERROR! SZ3 compression failed on rank %d for %s with cmp buffer %.2f MiB: %s\n",
+            printf("ERROR! SZo compression failed on rank %d for %s with cmp buffer %.2f MiB: %s\n",
                    world_rank, filename.c_str(), cmpBufferCap / 1048576.0, e.what());
             MPI_Abort(MPI_COMM_WORLD, 1);
             return 1;
@@ -394,21 +399,18 @@ int main(int argc, char * argv[])
         if(world_rank == 0) compAvg[i] = compSum / world_size;
         free(dataIn);
 
+        
         if (compressed_size[i] == 0) {
-            printf("SZ3 compression failed for %s\n", filename.c_str());
-            MPI_Abort(MPI_COMM_WORLD, 1);
+            printf("SZo compression failed for %s\n", filename.c_str());
+            MPI_Finalize();
             return 1;
         }
 
         total_size += compressed_size[i];
     }
 
-    for (size_t idx = 0; idx < part_output.size(); idx++) {
-        compressed_output.insert(compressed_output.end(),
-                                 reinterpret_cast<unsigned char *>(part_output[idx]),
-                                 reinterpret_cast<unsigned char *>(part_output[idx]) + part_compressed_size[idx]);
-        delete[] part_output[idx];
-    }
+    // concatenate all per-variable compressed buffers here, OUTSIDE the timed compress loop
+    for(size_t i = 0; i < active_parts * static_cast<size_t>(num_vars); i++) if(cmpArr[i]){ compressed_output.insert(compressed_output.end(), cmpArr[i], cmpArr[i]+cmpArrSize[i]); delete[] cmpArr[i]; }
 
     char zip_filename[1024];
     if (ensure_dir(output_dir) != 0) {
@@ -418,7 +420,7 @@ int main(int argc, char * argv[])
     }
 
     snprintf(zip_filename, sizeof(zip_filename), "%s/%s_%d_%d_%ld.out",
-             output_dir, "sz3", world_rank, (int)getpid(), (long)time(NULL));
+             output_dir, "szo", world_rank, (int)getpid(), (long)time(NULL));
     MPI_Barrier(MPI_COMM_WORLD);
     if(world_rank == 0) start = MPI_Wtime();
     if (writeData(compressed_output.data(), compressed_output.size(), zip_filename) != 0) {
@@ -457,23 +459,33 @@ int main(int argc, char * argv[])
     }
 
     unsigned char *compressed_input_pos = compressed_input;
-    float *dataOutArr[200] = {nullptr};
+    float *dataOutArr[200] = {nullptr};   // keep every decompressed buffer; free them together AFTER the timed loop
+//     if (!split_z) {
+//         // pre-allocate + THP-hint + prefault the outputs OUTSIDE the timed loop, so the timed
+//         // decompress measures the kernel (buffer-reuse semantics), not page faults/compaction
+//         for (int i = 0; i < num_vars; i++) {
+//             dataOutArr[i] = new float[nbEle];
+// #if defined(__linux__)
+//             uintptr_t _mb = (uintptr_t)dataOutArr[i] & ~(uintptr_t)4095;
+//             madvise((void *)_mb, nbEle * sizeof(float) + ((uintptr_t)dataOutArr[i] - _mb), MADV_HUGEPAGE);
+// #endif
+//             memset(dataOutArr[i], 0, nbEle * sizeof(float));
+//         }
+//     }
     for(int i = 0; i < num_vars; i++){
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0) start = MPI_Wtime();
         if (split_z) {
             for (size_t p = 0; p < active_parts; p++) {
+                SZo::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
                 const size_t idx = i * active_parts + p;
-                SZ3::Config dec_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-                SZ_decompress<float>(dec_conf, reinterpret_cast<char*>(compressed_input_pos),
-                                     part_compressed_size[idx], dataOutArr[idx]);
-                compressed_input_pos += part_compressed_size[idx];
+                dataOutArr[idx] = SZ_decompress<float>(slab_conf, reinterpret_cast<char*>(compressed_input_pos), cmpArrSize[idx]);
+                compressed_input_pos += cmpArrSize[idx];
             }
         } else {
-            SZ3::Config dec_conf = conf;
-            SZ_decompress<float>(dec_conf, reinterpret_cast<char*>(compressed_input_pos),
-                                 part_compressed_size[i], dataOutArr[i]);
-            compressed_input_pos += part_compressed_size[i];
+            SZo::Config dec_conf = conf;
+            SZ_decompress<float>(dec_conf, reinterpret_cast<char*>(compressed_input_pos), compressed_size[i], dataOutArr[i]);
+            compressed_input_pos += compressed_size[i];
         }
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0){
@@ -481,7 +493,7 @@ int main(int argc, char * argv[])
             costDecomp += end - start;
         }
     }
-    for (size_t idx = 0; idx < part_output.size(); idx++) delete[] dataOutArr[idx];
+    for(size_t i = 0; i < active_parts * static_cast<size_t>(num_vars); i++) delete[] dataOutArr[i];   // unified delete, outside the timed region
     free(compressed_input);
 
     double totalCompMin = 0.0;
@@ -493,7 +505,7 @@ int main(int argc, char * argv[])
 
     if (world_rank == 0)
     {
-        printf("SZ3 Finish parallel compressing on %s, total compression ratio %.4g.\n", dataset_name, 1.0 * total_original_size / total_size);
+        printf("SZo Finish parallel compressing on %s, total compression ratio %.4g.\n", dataset_name, 1.0 * total_original_size / total_size);
         printf("Separate ratios: ");
         for(int i = 0; i < num_vars; i++){
             printf("%.4g ", 1.0 * original_size[i] / compressed_size[i]);

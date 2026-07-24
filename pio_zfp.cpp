@@ -1,338 +1,701 @@
 #include <stdio.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
+#include <string>
+#include <fstream>
 #include <iostream>
+#include <sstream>
+#include <algorithm>
+#include <vector>
+
+#ifndef OMPI_SKIP_MPICXX
+#define OMPI_SKIP_MPICXX 1
+#endif
+
+#ifndef MPICH_SKIP_MPICXX
+#define MPICH_SKIP_MPICXX 1
+#endif
+
+#ifndef USE_VANILLA_CONFIG
+#define USE_VANILLA_CONFIG 1
+#endif
+
+#include "SPERR_C_API.h"
 #include "mpi.h"
-#include "rw.h"
-#include "zfp.h"
 
-unsigned char* zfp_compress_3D(float* array, double tolerance, size_t r1, size_t r2, size_t r3, size_t* out_size) {
-    int status = 0;    /* return value: 0 = success */
-    zfp_type type;     /* array scalar type */
-    zfp_field* field;  /* array meta data */
-    zfp_stream* zfp;   /* compressed stream */
-    void* buffer;      /* storage for compressed stream */
-    size_t bufsize;    /* byte size of compressed buffer */
-    bitstream* stream; /* bit stream to write to or read from */
-    size_t zfpsize;    /* byte size of compressed stream */
-
-    /* allocate meta data for the 3D array a[nz][ny][nx] */
-    type = zfp_type_float;
-    field = zfp_field_3d(array, type, r3, r2, r1);
-
-    /* allocate meta data for a compressed stream */
-    zfp = zfp_stream_open(NULL);
-
-    /* set compression mode and parameters via one of three functions */
-    /*  zfp_stream_set_rate(zfp, rate, type, 3, 0); */
-    /*  zfp_stream_set_precision(zfp, precision); */
-    zfp_stream_set_accuracy(zfp, tolerance);
-
-    /* allocate buffer for compressed data */
-    bufsize = zfp_stream_maximum_size(zfp, field);
-    buffer = malloc(bufsize);
-
-    /* associate bit stream with allocated buffer */
-    stream = stream_open(buffer, bufsize);
-    zfp_stream_set_bit_stream(zfp, stream);
-    zfp_stream_rewind(zfp);
-
-    zfpsize = zfp_compress(zfp, field);
-    if (!zfpsize) {
-        fprintf(stderr, "compression failed\n");
-        status = 1;
+static int ensure_dir(const char* dir)
+{
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        errno = ENOTDIR;
+        return -1;
     }
-
-    zfp_field_free(field);
-    zfp_stream_close(zfp);
-    stream_close(stream);
-    *out_size = zfpsize;
-    return (unsigned char*)buffer;
+    if (mkdir(dir, 0777) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
 }
 
-float* zfp_decompress_3D(unsigned char* comp_data, double tolerance, size_t buffer_size, size_t r1, size_t r2, size_t r3) {
-    int status = 0;    /* return value: 0 = success */
-    zfp_type type;     /* array scalar type */
-    zfp_field* field;  /* array meta data */
-    zfp_stream* zfp;   /* compressed stream */
-    void* buffer;      /* storage for compressed stream */
-    size_t bufsize;    /* byte size of compressed buffer */
-    bitstream* stream; /* bit stream to write to or read from */
-    size_t zfpsize;    /* byte size of compressed stream */
-
-    /* allocate meta data for the 3D array a[nz][ny][nx] */
-    float* array = (float*)malloc(r1 * r2 * r3 * sizeof(float));
-    type = zfp_type_float;
-    field = zfp_field_3d(array, type, r3, r2, r1);
-
-    /* allocate meta data for a compressed stream */
-    zfp = zfp_stream_open(NULL);
-
-    /* set compression mode and parameters via one of three functions */
-    /*  zfp_stream_set_rate(zfp, rate, type, 3, 0); */
-    /*  zfp_stream_set_precision(zfp, precision); */
-    zfp_stream_set_accuracy(zfp, tolerance);
-
-    /* allocate buffer for compressed data */
-    bufsize = zfp_stream_maximum_size(zfp, field);
-    // buffer = malloc(bufsize);
-    buffer = (void*)comp_data;
-    bufsize = buffer_size;
-
-    /* associate bit stream with allocated buffer */
-    stream = stream_open(buffer, bufsize);
-    zfp_stream_set_bit_stream(zfp, stream);
-    zfp_stream_rewind(zfp);
-
-    if (!zfp_decompress(zfp, field)) {
-        fprintf(stderr, "decompression failed\n");
-        status = 1;
-    }
-    zfp_field_free(field);
-    zfp_stream_close(zfp);
-    stream_close(stream);
-    return array;
+static int writeData(const unsigned char* bytes, size_t byte_length, const char* filename)
+{
+    std::ofstream fout(filename, std::ios::binary);
+    if (!fout) return -1;
+    fout.write(reinterpret_cast<const char*>(bytes), byte_length);
+    if (!fout.good()) return -1;
+    return 0;
 }
 
+static unsigned char* readBytes(const char *srcFilePath, size_t *byteSize)
+{
+    std::ifstream inFile(srcFilePath, std::ios::binary);
+    if (!inFile.good()) return NULL;
+    inFile.seekg(0, std::ios::end);
+    std::streamoff inSize = inFile.tellg();
+    if (inSize <= 0) return NULL;
+    inFile.seekg(0, std::ios::beg);
 
-int main(int argc, char* argv[]) {
-    srand(time(0));
-    char* cfgFile;
+    unsigned char *daBuf = (unsigned char *)malloc(static_cast<size_t>(inSize));
+    if (daBuf == NULL) {
+        std::cerr << "Failed to allocate input buffer" << std::endl;
+        return NULL;
+    }
+    if (!inFile.read(reinterpret_cast<char*>(daBuf), inSize)) {
+        std::cerr << "Failed to read file" << std::endl;
+        free(daBuf);
+        return NULL;
+    }
+    *byteSize = static_cast<size_t>(inSize);
+    return daBuf;
+}
 
-    MPI_Init(NULL, NULL);
+static unsigned char* readFloatData(const char *srcFilePath, size_t *nbEle)
+{
+    size_t byteSize = 0;
+    unsigned char *data = readBytes(srcFilePath, &byteSize);
+    if (data == NULL) return NULL;
+    *nbEle = byteSize / sizeof(float);
+    return data;
+}
 
+static double dataRange(const float *data, size_t nbEle)
+{
+    if (nbEle == 0) return 0.0;
+    float minVal = data[0];
+    float maxVal = data[0];
+    for (size_t i = 1; i < nbEle; i++) {
+        const float v = data[i];
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
+    }
+    return static_cast<double>(maxVal - minVal);
+}
+
+static const char* sperr_status_string(int status)
+{
+    switch (status) {
+        case 0: return "success";
+        case 1: return "output pointer must be NULL";
+        case 2: return "unsupported or invalid parameter";
+        case -1: return "internal SPERR error";
+        default: return "unknown SPERR error";
+    }
+}
+
+struct SperrVolume {
+    bool is3d;
+    size_t dimx;
+    size_t dimy;
+    size_t dimz;
+};
+
+static SperrVolume make_sperr_volume(size_t r1, size_t r2, size_t r3, size_t r4)
+{
+    SperrVolume volume;
+    volume.dimx = r1;
+    volume.dimy = r2;
+    volume.dimz = r3 * r4;
+    volume.is3d = (volume.dimz > 1);
+    if (!volume.is3d) {
+        volume.dimy = std::max<size_t>(volume.dimy, 1);
+        volume.dimz = 1;
+    }
+    return volume;
+}
+
+static size_t default_chunk(size_t dim)
+{
+    return std::min<size_t>(dim, 256);
+}
+
+static int sperr_compress_float(const float* data,
+                                const SperrVolume& volume,
+                                double absErrorBound,
+                                size_t sperr_threads,
+                                unsigned char** output,
+                                size_t* compressedSize)
+{
+    if (output == NULL || compressedSize == NULL) return 2;
+    *output = NULL;
+    *compressedSize = 0;
+    void* bytesOut = NULL;
+    size_t bytesOutSize = 0;
+    int status = 0;
+    if (volume.is3d) {
+        status = C_API::sperr_comp_3d(data, 1,
+                                      volume.dimx, volume.dimy, volume.dimz,
+                                      default_chunk(volume.dimx),
+                                      default_chunk(volume.dimy),
+                                      default_chunk(volume.dimz),
+                                      3, absErrorBound, sperr_threads,
+                                      &bytesOut, &bytesOutSize);
+    } else {
+        status = C_API::sperr_comp_2d(data, 1,
+                                      volume.dimx, volume.dimy,
+                                      3, absErrorBound, 0,
+                                      &bytesOut, &bytesOutSize);
+    }
+
+    if (status != 0 || bytesOut == NULL || bytesOutSize == 0) {
+        if (bytesOut != NULL) free(bytesOut);
+        return status == 0 ? -1 : status;
+    }
+
+    *output = static_cast<unsigned char*>(bytesOut);
+    *compressedSize = bytesOutSize;
+    return 0;
+}
+
+static int sperr_decompress_float(const unsigned char* input,
+                                  size_t inputSize,
+                                  const SperrVolume& volume,
+                                  size_t sperr_threads,
+                                  void** dataOut)
+{
+    if (dataOut == NULL) return 2;
+    *dataOut = NULL;
+    int status = 0;
+    if (volume.is3d) {
+        size_t dimx = 0;
+        size_t dimy = 0;
+        size_t dimz = 0;
+        status = C_API::sperr_decomp_3d(input, inputSize, 1, sperr_threads,
+                                        &dimx, &dimy, &dimz, dataOut);
+        if (status == 0 && (dimx != volume.dimx || dimy != volume.dimy || dimz != volume.dimz)) {
+            free(*dataOut);
+            *dataOut = NULL;
+            return 2;
+        }
+    } else {
+        status = C_API::sperr_decomp_2d(input, inputSize, 1,
+                                        volume.dimx, volume.dimy, dataOut);
+    }
+
+    if (status != 0 || *dataOut == NULL) {
+        if (*dataOut != NULL) free(*dataOut);
+        *dataOut = NULL;
+        return status == 0 ? -1 : status;
+    }
+    return 0;
+}
+
+static void usage()
+{
+    printf("Test case: pio_sperr -e error_bound -d dataset_name -i list_file -o output_dir -n nums [-z [parts]] [-t sperr_threads] [-1 r1 | -2 r1 r2 | -3 r1 r2 r3 | -4 r1 r2 r3 r4]\n");
+    printf("Example: pio_sperr -e 1e-3 -d nyx -i /path/to/list.txt -o /path/to/out -n 4 -z 4 -3 r1 r2 r3\n");
+    printf("Note: -e is treated as relative error; SPERR receives PWE = -e * data_range. -4 is compressed as 3D with dimz = r3 * r4.\n");
+}
+
+int main(int argc, char * argv[])
+{
+    MPI_Init(&argc, &argv);
     int world_size;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-
     int world_rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-   
-    double * absbound;
-
-    //Begin modify this part
-
-    char* file_folder = "/home/x-jliu18/Jinyang/datasets/Hurricane";
-    int num_vars = atoi(argv[1]);
-
-    //Begin modify this part
-    int hurricane_num_vars = 13;
-/*    char hurricane_file[13][50] = {"Uf48_truncated.bin.f32", "Vf48_truncated.bin.f32", "Wf48_truncated.bin.f32",
-                                   "TCf48_truncated.bin.f32", "Pf48_truncated.bin.f32", "QVAPORf48_truncated.bin.f32",
-                                   "CLOUDf48_log10_truncated.bin.f32", "QCLOUDf48_log10_truncated.bin.f32", "QICEf48_log10_truncated.bin.f32",
-                                   "QRAINf48_log10_truncated.bin.f32", "QSNOWf48_log10_truncated.bin.f32", "QGRAUPf48_log10_truncated.bin.f32",
-                                   "PRECIPf48_log10_truncated.bin.f32"};*/
-    char hurricane_file[13][50] = {"Uf48.bin.f32", "Vf48.bin.f32", "Wf48.bin.f32",
-                                   "TCf48.bin.f32", "Pf48.bin.f32", "QVAPORf48.bin.f32",
-                                   "CLOUDf48.log10.bin.f32", "QCLOUDf48.log10.bin.f32", "QICEf48.log10.bin.f32",
-                                   "QRAINf48.log10.bin.f32", "QSNOWf48.log10.bin.f32", "QGRAUPf48.log10.bin.f32",
-                                   "PRECIPf48.log10.bin.f32"};    
-//double hurricane_abs_bound[13] = {1.851616, 1.874008, 0.331488, 2.12402, 132.72278, 0.0004084144, 0.20304, 0.7021114, 0.373662, 0.714628, 0.695594, 0.715312, 0.716028};
-double hurricane_abs_bound[13] = {9.258076e-02,9.370042e-02,1.657436e-02,1.062011e-01,6.636139e+00,2.042072e-05,1.015203e-02,3.510567e-02,1.868306e-02,3.573139e-02,3.477967e-02,3.576564e-02,3.580139e-02};    
-// miranda
-    int miranda_num_vars = 7;
-    char miranda_file[7][50] = {"velocityy_truncated.bin.f32", "velocityx_truncated.bin.f32", "density_truncated.bin.f32",
-                                "pressure_truncated.bin.f32", "velocityz_truncated.bin.f32", "viscocity_truncated.bin.f32",
-                                "diffusivity_truncated.bin.f32"};
-    double miranda_abs_bound[7] = {0.1317327, 0.135345, 0.06, 0.1324284, 0.4246152, 0.0786399, 0.07845450000000001};
-
-    int scale_num_vars = 12;
-    char scale_file[12][50] = {"PRES-98x1200x1200.f32", "QC-98x1200x1200.log10.f32", "QG-98x1200x1200.log10.f32",
-                                   "QI-98x1200x1200.log10.f32", "QR-98x1200x1200.log10.f32", "QS-98x1200x1200.log10.f32",
-                                   "QV-98x1200x1200.log10.f32", "RH-98x1200x1200.f32", "T-98x1200x1200.f32",
-                                   "U-98x1200x1200.f32", "V-98x1200x1200.f32", "W-98x1200x1200.f32",
-                                  };
-    double scale_abs_bound[12] ={1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3};
-
-    int aramco_num_vars = 60;
-    char aramco_file[60][50];
-    double aramco_abs_bound[60];
-    for (int i=0;i<60;i++){
-        //char name[50];
-        sprintf(aramco_file[i],"aramco-snapshot-%d.f32",1000+10*i);
-        //salt_file[i]=name;
-        aramco_abs_bound[i]=1e-3;
-
-    }
-
-
-
-
-
-    char file[100][50];
-    
-    
-    if (num_vars == hurricane_num_vars) {
-        for (int i = 0; i < num_vars; i++) strcpy(file[i], hurricane_file[i]);
-        absbound = hurricane_abs_bound;
-    } else if (num_vars == miranda_num_vars) {
-        for (int i = 0; i < num_vars; i++) strcpy(file[i], miranda_file[i]);
-        absbound = miranda_abs_bound;
-    } 
-    else if (num_vars == scale_num_vars) {
-        for (int i = 0; i < num_vars; i++) strcpy(file[i], scale_file[i]);
-        absbound = scale_abs_bound;
-    }
-    else if (num_vars == aramco_num_vars) {
-        for (int i = 0; i < num_vars; i++) strcpy(file[i], aramco_file[i]);
-        absbound = aramco_abs_bound;
-    }
-    else {
-        printf("No such variable, exit\n");
-//        SZ_Finalize();
+    srand(time(0));
+    if(argc < 6)
+    {
+        if (world_rank == 0) usage();
         MPI_Finalize();
         return 0;
     }
 
+    size_t r4 = 1;
+    size_t r3 = 1;
+    size_t r2 = 1;
+    size_t r1 = 1;
 
-    size_t  r1,r2,r3,r4,r5; //384 384 256, 500 500 100
-    r1 = atof(argv[2]);
-    r2 = atof(argv[3]);
-    r3= atof(argv[4]);
-    r4=0;
-    r5=0;
-   
-    //End modify this part
-    //End modify this part
+    double eb = 1e-3;
+    char *dataset_name = NULL;
+    char *folder = NULL;
+    const char *output_dir = "./out";
+    int num_vars = 0;
+    bool split_z = false;
+    size_t z_parts = 1;
+    size_t sperr_threads = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            if (world_rank == 0) usage();
+            MPI_Finalize();
+            return 1;
+        }
+        switch (argv[i][1]) {
+            case '1':
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r2 = r3 = r4 = 1;
+                break;
+            case '2':
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r3 = r4 = 1;
+                break;
+            case '3':
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r3) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r4 = 1;
+                break;
+            case '4':
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r3) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r4) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                break;
+            case 'e':
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                eb = atof(argv[i]);
+                break;
+            case 'i':
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                folder = argv[i];
+                break;
+            case 'o':
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                output_dir = argv[i];
+                break;
+            case 'n':
+                if (++i == argc || sscanf(argv[i], "%d", &num_vars) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                break;
+            case 'd':
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                dataset_name = argv[i];
+                break;
+            case 'z':
+                split_z = true;
+                z_parts = 2;
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    if (sscanf(argv[++i], "%zu", &z_parts) != 1) {
+                        if (world_rank == 0) usage();
+                        MPI_Finalize();
+                        return 1;
+                    }
+                }
+                break;
+            case 't':
+                if (++i == argc || sscanf(argv[i], "%zu", &sperr_threads) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                break;
+            default:
+                if (world_rank == 0) usage();
+                MPI_Finalize();
+                return 1;
+        }
+    }
+
+    if (dataset_name == NULL || folder == NULL || num_vars <= 0) {
+        if (world_rank == 0) {
+            printf("ERROR: Missing required arguments: -d (dataset_name), -i (list file), or -n (num_vars).\n");
+            usage();
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    if (num_vars > 100) {
+        if (world_rank == 0) printf("ERROR: -n nums must be <= 100.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    if (eb <= 0.0) {
+        if (world_rank == 0) printf("ERROR: -e error_bound must be positive.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    if (r1 == 0 || r2 == 0 || r3 == 0 || r4 == 0) {
+        if (world_rank == 0) printf("ERROR: all dimensions must be positive.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    if (split_z && (r4 != 1 || r3 <= 1 || z_parts < 2 || z_parts > r3)) {
+        if (world_rank == 0) printf("ERROR: -z currently supports only 3D data with z dimension > 1 and 2 <= parts <= z dimension.\n");
+        MPI_Finalize();
+        return 1;
+    }
+
+    std::ifstream list_file(folder);
+    if (!list_file.good()) {
+        if (world_rank == 0) printf("ERROR! Input information folder %s does not exist or is not accessible.\n", folder);
+        MPI_Finalize();
+        return 1;
+    }
+
+    std::string line;
+    std::string input_dir;
+    std::vector<std::string> files;
+    bool found_dataset = false;
+    while (std::getline(list_file, line)) {
+        if (!found_dataset) {
+            std::istringstream iss(line);
+            std::string name;
+            std::string dir;
+            iss >> name >> dir;
+            if (!name.empty() && strcasecmp(name.c_str(), dataset_name) == 0) {
+                found_dataset = true;
+                input_dir = dir;
+            }
+        } else {
+            std::istringstream iss(line);
+            std::string filename;
+            iss >> filename;
+            if (!filename.empty()) files.push_back(filename);
+            if (static_cast<int>(files.size()) >= num_vars) break;
+        }
+    }
+    list_file.close();
+
+    if (!found_dataset || static_cast<int>(files.size()) < num_vars) {
+        if (world_rank == 0) {
+            printf("ERROR! Dataset %s was not found in %s or has fewer than %d listed variables.\n",
+                   dataset_name, folder, num_vars);
+        }
+        MPI_Finalize();
+        return 1;
+    }
 
     if (world_rank == 0) printf("Start parallel compressing ... \n");
     if (world_rank == 0) printf("size: %d\n", world_size);
-    double start, end;
-    double costReadOri = 0.0, costReadZip = 0.0, costWriteZip = 0.0, costWriteOut = 0.0, costComp = 0.0, costDecomp = 0.0;
+    if (world_rank == 0) printf("SPERR OpenMP threads per MPI process: %zu\n", sperr_threads);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    size_t compressed_size[100];
-    char zip_filename[100];
-    // char out_filename[100];
-    size_t inSize, outSize;
-    size_t nbEle;
-    int status;
-    float* dataIn;
+    size_t compressed_size[100] = {0};
+    size_t original_size[100] = {0};
 
-    size_t est_compressed_size = r1 * r2 * r3 * sizeof(float) * num_vars / 3;
-    unsigned char* compressed_output = (unsigned char*)malloc(est_compressed_size);
-    unsigned char* compressed_output_pos = compressed_output;
-    int folder_index = world_rank;
-    for (int i = 0; i < num_vars; i++) {
-        char filename[100];
-        sprintf(filename, "%s/%s", file_folder, file[i]);
-        // std::cout<<filename<<std::endl;
-        // Read Input Data
-        if (world_rank == 0) {
+    size_t total_original_size = 0;
+    size_t total_size = 0;
+    std::vector<unsigned char> compressed_output;
+    const size_t active_parts = split_z ? z_parts : 1;
+    if (num_vars * active_parts > 200) {
+        if (world_rank == 0) printf("ERROR: num_vars * z parts must be <= 200.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    std::vector<size_t> part_compressed_size(num_vars * active_parts, 0);
+    std::vector<unsigned char*> part_output(num_vars * active_parts, NULL);
+
+    float *dataIn;
+    std::vector<size_t> z_offsets(active_parts + 1, 0);
+    for (size_t p = 0; p <= active_parts; p++) {
+        z_offsets[p] = split_z ? (r3 * p / active_parts) : (p == 0 ? 0 : r3);
+    }
+    if (world_rank == 0 && split_z) {
+        printf("z-axis split into %zu slabs:", active_parts);
+        for (size_t p = 0; p < active_parts; p++) printf(" %zu", z_offsets[p + 1] - z_offsets[p]);
+        printf("\n");
+    }
+
+    SperrVolume volume = make_sperr_volume(r1, r2, r3, r4);
+    auto make_slab_volume = [&](size_t slab_z) {
+        SperrVolume slab;
+        slab.is3d = true;
+        slab.dimx = r1;
+        slab.dimy = r2;
+        slab.dimz = slab_z;
+        return slab;
+    };
+
+    double start, end;
+    double costReadOri = 0.0, costComp = 0.0;
+    double costBoundPrep = 0.0;
+    double costWriteZip = 0.0, costReadZip = 0.0, costDecomp = 0.0;
+    double localCompTotal = 0.0;
+    double compMin[100] = {0.0};
+    double compMax[100] = {0.0};
+    double compAvg[100] = {0.0};
+
+    size_t nbEle;
+    size_t expected_nbEle = r1 * r2 * r3 * r4;
+    for(int i = 0; i < num_vars; i++) {
+        std::string filename = input_dir + "/" + files[i];
+        if(world_rank == 0){
             start = MPI_Wtime();
-            dataIn = readFloatData(filename, &nbEle, &status);
-            end = MPI_Wtime();
-            // printf("file %s read time: %.2f\n", filename, end - start);
-            start = MPI_Wtime();
+            dataIn = reinterpret_cast<float*>(readFloatData(filename.c_str(), &nbEle));
+            if (dataIn == NULL || nbEle == 0) {
+                printf("ERROR! Failed to read input file %s\n", filename.c_str());
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return 1;
+            }
+            if (nbEle != expected_nbEle) {
+                printf("ERROR! Dimension mismatch for %s: file has %zu elements, but dataset %s expects %zu (%zu x %zu x %zu x %zu)\n",
+                       filename.c_str(), nbEle, dataset_name, expected_nbEle, r1, r2, r3, r4);
+                free(dataIn);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return 1;
+            }
             MPI_Bcast(&nbEle, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             MPI_Bcast(dataIn, nbEle, MPI_FLOAT, 0, MPI_COMM_WORLD);
-            end = MPI_Wtime();
-            // printf("broadcast time: %.2f\n", end - start);
-        } else {
+        }
+        else{
             MPI_Bcast(&nbEle, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-            dataIn = (float*)malloc(nbEle * sizeof(float));
+            dataIn = (float *) malloc(nbEle * sizeof(float));
+            if (dataIn == NULL) {
+                printf("ERROR! Failed to allocate input buffer on rank %d\n", world_rank);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return 1;
+            }
+#if defined(__linux__)
+            uintptr_t pageBase = reinterpret_cast<uintptr_t>(dataIn) & ~static_cast<uintptr_t>(4095);
+            madvise(reinterpret_cast<void *>(pageBase),
+                    nbEle * sizeof(float) + (reinterpret_cast<uintptr_t>(dataIn) - pageBase),
+                    MADV_HUGEPAGE);
+#endif
             MPI_Bcast(dataIn, nbEle, MPI_FLOAT, 0, MPI_COMM_WORLD);
         }
         MPI_Barrier(MPI_COMM_WORLD);
-        if (world_rank == 0) {
+        if(world_rank == 0){
             end = MPI_Wtime();
             costReadOri += end - start;
         }
 
-        // float max = dataIn[0];
-        // float min = dataIn[0];
-        // for (int j = 1; j < r1 * r2 * r3; j++) {
-        //     if (max < dataIn[j]) max = dataIn[j];
-        //     if (min > dataIn[j]) min = dataIn[j];
-        // }
-        // absbound[i] = rel_bound[i] * (max - min);
+        original_size[i] = nbEle * sizeof(float);
+        total_original_size += original_size[i];
 
-        // Compress Input Data
-        size_t out_size;
-        // if (world_rank == 0) printf ("Compressing %s\n", filename);
+        double absErrorBound = 0.0;
         MPI_Barrier(MPI_COMM_WORLD);
-        if (world_rank == 0) start = MPI_Wtime();
-        unsigned char* bytesOut = zfp_compress_3D(dataIn, absbound[i], r3, r2, r1, &compressed_size[i]);
+        if(world_rank == 0) start = MPI_Wtime();
+        if(world_rank == 0) {
+            absErrorBound = eb * dataRange(dataIn, nbEle);
+            if (absErrorBound <= 0.0) absErrorBound = eb;
+        }
+        MPI_Bcast(&absErrorBound, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Barrier(MPI_COMM_WORLD);
-        if (world_rank == 0) {
+        if(world_rank == 0){
+            end = MPI_Wtime();
+            costBoundPrep += end - start;
+        }
+
+        if(world_rank == 0) start = MPI_Wtime();
+        double localCompStart = MPI_Wtime();
+        int status = 0;
+        if (split_z) {
+            const size_t xy = r1 * r2;
+            compressed_size[i] = 0;
+            for (size_t p = 0; p < active_parts; p++) {
+                SperrVolume slab_volume = make_slab_volume(z_offsets[p + 1] - z_offsets[p]);
+                const size_t idx = i * active_parts + p;
+                status = sperr_compress_float(dataIn + z_offsets[p] * xy, slab_volume, absErrorBound,
+                                              sperr_threads, &part_output[idx], &part_compressed_size[idx]);
+                if (status != 0) break;
+                compressed_size[i] += part_compressed_size[idx];
+            }
+        } else {
+            const size_t idx = i;
+            status = sperr_compress_float(dataIn, volume, absErrorBound, sperr_threads,
+                                          &part_output[idx], &part_compressed_size[idx]);
+            compressed_size[i] = part_compressed_size[idx];
+        }
+        double localCompTime = MPI_Wtime() - localCompStart;
+        localCompTotal += localCompTime;
+        MPI_Barrier(MPI_COMM_WORLD);
+        if(world_rank == 0){
             end = MPI_Wtime();
             costComp += end - start;
         }
-        free(dataIn);
-        memcpy(compressed_output_pos, bytesOut, compressed_size[i]);
-        compressed_output_pos += compressed_size[i];
-        free(bytesOut);
-    }
-    struct stat st = {0};
-    if (stat("/home/x-jliu18/Jinyang/datasets/tmp", &st) == -1) {
-        mkdir("/home/x-jliu18/Jinyang/datasets/tmp", 0777);
-    }
-    sprintf(zip_filename, "%s/zfp_%d_%d.out", "/home/x-jliu18/Jinyang/datasets/tmp", folder_index, rand());  // Write Compressed Data
 
-    size_t total_size = compressed_output_pos - compressed_output;
-    // Write Compressed Data
+        double compSum = 0.0;
+        MPI_Reduce(&localCompTime, &compMin[i], 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&localCompTime, &compMax[i], 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&localCompTime, &compSum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if(world_rank == 0) compAvg[i] = compSum / world_size;
+        free(dataIn);
+
+        if (status != 0 || compressed_size[i] == 0) {
+            printf("SPERR compression failed on rank %d for %s: %s\n",
+                   world_rank, filename.c_str(), sperr_status_string(status));
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
+        }
+
+        total_size += compressed_size[i];
+    }
+
+    for (size_t idx = 0; idx < part_output.size(); idx++) {
+        compressed_output.insert(compressed_output.end(), part_output[idx],
+                                 part_output[idx] + part_compressed_size[idx]);
+        free(part_output[idx]);
+    }
+
+    char zip_filename[1024];
+    if (ensure_dir(output_dir) != 0) {
+        printf("ERROR! Failed to prepare output dir %s: %s\n", output_dir, strerror(errno));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
+
+    snprintf(zip_filename, sizeof(zip_filename), "%s/%s_%d_%d_%ld.out",
+             output_dir, "sperr", world_rank, (int)getpid(), (long)time(NULL));
     MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) start = MPI_Wtime();
-    // if (world_rank == 0) printf("write compressed file to disk %s \n", zip_filename);
-    writeByteData(compressed_output, total_size, zip_filename, &status);
+    if(world_rank == 0) start = MPI_Wtime();
+    if (writeData(compressed_output.data(), compressed_output.size(), zip_filename) != 0) {
+        printf("ERROR! Failed to write compressed file %s: %s\n", zip_filename, strerror(errno));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
     MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) {
+    if(world_rank == 0){
         end = MPI_Wtime();
         costWriteZip += end - start;
     }
-    free(compressed_output);
-    // Read Compressed Data
+    compressed_output.clear();
+    compressed_output.shrink_to_fit();
+
+    size_t inSize = 0;
     MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) start = MPI_Wtime();
-    // if (world_rank == 0) printf("read compressed file from disk %s \n", zip_filename);
-    compressed_output = readByteData(zip_filename, &inSize, &status);
-    if (inSize != total_size) {
-        printf("ERROR! Broken file : %s", zip_filename);
-    } else {
-        remove(zip_filename);
+    if(world_rank == 0) start = MPI_Wtime();
+    unsigned char *compressed_input = readBytes(zip_filename, &inSize);
+    if (compressed_input == NULL) {
+        printf("ERROR! Failed to read compressed file %s: %s\n", zip_filename, strerror(errno));
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
     }
+    if (inSize != total_size) {
+        printf("ERROR! Broken file : %s (expected %zu bytes, got %zu bytes)\n", zip_filename, total_size, inSize);
+        free(compressed_input);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return 1;
+    }
+    remove(zip_filename);
     MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) {
+    if(world_rank == 0){
         end = MPI_Wtime();
         costReadZip += end - start;
     }
-    compressed_output_pos = compressed_output;
-    for (int i = 0; i < num_vars; i++) {
-        // Decompress Compressed Data`
+
+    unsigned char *compressed_input_pos = compressed_input;
+    void *dataOutArr[200] = {nullptr};
+    for(int i = 0; i < num_vars; i++){
         MPI_Barrier(MPI_COMM_WORLD);
-        // if (world_rank == 0) printf("decompress %d-th field\n", i);
-        if (world_rank == 0) start = MPI_Wtime();
-        float* dataOut = zfp_decompress_3D(compressed_output_pos, absbound[i], compressed_size[i], r3, r2, r1);
+        if(world_rank == 0) start = MPI_Wtime();
+        int status = 0;
+        if (split_z) {
+            for (size_t p = 0; p < active_parts; p++) {
+                SperrVolume slab_volume = make_slab_volume(z_offsets[p + 1] - z_offsets[p]);
+                const size_t idx = i * active_parts + p;
+                status = sperr_decompress_float(compressed_input_pos, part_compressed_size[idx],
+                                                slab_volume, sperr_threads, &dataOutArr[idx]);
+                compressed_input_pos += part_compressed_size[idx];
+                if (status != 0) break;
+            }
+        } else {
+            status = sperr_decompress_float(compressed_input_pos, part_compressed_size[i],
+                                            volume, sperr_threads, &dataOutArr[i]);
+            compressed_input_pos += part_compressed_size[i];
+        }
         MPI_Barrier(MPI_COMM_WORLD);
-        if (world_rank == 0) {
+        if(world_rank == 0){
             end = MPI_Wtime();
             costDecomp += end - start;
         }
-        compressed_output_pos += compressed_size[i];
-        free(dataOut);
-    }
-    free(compressed_output);
-    if (world_rank == 0) {
-        printf("ZFP Finish parallel compressing, total compression ratio = %.4g\n", 1.0 * r1 * r2 * r3 * sizeof(float) * num_vars / total_size);
-        printf("Separate ratios\n");
-        for (int i = 0; i < num_vars; i++) {
-            printf("%s = %.4g \n", file[i], 1.0 * r1 * r2 * r3 * sizeof(float) / compressed_size[i]);
+        if (status != 0) {
+            printf("SPERR decompression failed on rank %d for field %d: %s\n",
+                   world_rank, i, sperr_status_string(status));
+            free(compressed_input);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
         }
-        // printf("\n");
-        // printf("Timecost of reading original files = %.2f seconds\n", costReadOri);
+    }
+    for (size_t idx = 0; idx < part_output.size(); idx++) free(dataOutArr[idx]);
+    free(compressed_input);
+
+    double totalCompMin = 0.0;
+    double totalCompMax = 0.0;
+    double totalCompSum = 0.0;
+    MPI_Reduce(&localCompTotal, &totalCompMin, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&localCompTotal, &totalCompMax, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&localCompTotal, &totalCompSum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (world_rank == 0)
+    {
+        printf("SPERR Finish parallel compressing on %s, total compression ratio %.4g.\n", dataset_name, 1.0 * total_original_size / total_size);
+        printf("Separate ratios: ");
+        for(int i = 0; i < num_vars; i++){
+            printf("%.4g ", 1.0 * original_size[i] / compressed_size[i]);
+        }
+        printf("\n");
+        printf("Timecost of reading original files = %.4f seconds\n", costReadOri);
+        printf("Timecost of preparing relative error bounds = %.4f seconds\n", costBoundPrep);
         printf("Timecost of compressing using %d processes = %.4f seconds\n", world_size, costComp);
+        printf("Local compression time total min/max/avg = %.4f %.4f %.4f seconds\n",
+               totalCompMin, totalCompMax, totalCompSum / world_size);
+        printf("Local compression time per variable min/max/avg:\n");
+        for(int i = 0; i < num_vars; i++){
+            printf("  %s: %.4f %.4f %.4f seconds\n", files[i].c_str(), compMin[i], compMax[i], compAvg[i]);
+        }
         printf("Timecost of writing compressed files = %.4f seconds\n", costWriteZip);
         printf("Timecost of reading compressed files = %.4f seconds\n", costReadZip);
         printf("Timecost of decompressing using %d processes = %.4f seconds\n", world_size, costDecomp);
-        // printf("Timecost of writing decompressed files = %.2f seconds\n", costWriteOut);
-        printf("Throughput of reading compressed files = %.4f GB/s\n", total_size * world_size / 1000.0 / 1000 / 1000 / costReadZip);
-        printf("Throughput of writing compressed files = %.4f GB/s\n", total_size * world_size / 1000.0 / 1000 / 1000 / costWriteZip);
     }
+
     MPI_Finalize();
     return 0;
 }
