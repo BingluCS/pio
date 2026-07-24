@@ -89,13 +89,27 @@ mpicxx -O3 pio_sz3.cpp -o pio_sz3 \
 
 ### SPERR
 
+先构建 SPERR。关闭单元测试可以避免下载 GoogleTest：
+
 ```bash
+cd /home/lb/compressor/SPERR
+cmake -S . -B build -DBUILD_UNIT_TESTS=OFF
+cmake --build build -j
+```
+
+然后编译 PIO：
+
+```bash
+cd /home/lb/compressor/pio
 mpicxx -O3 pio_sperr.cpp -o pio_sperr \
   -I/home/lb/compressor/SPERR/include \
+  -I/home/lb/compressor/SPERR/build \
   -L/home/lb/compressor/SPERR/build/src \
   -Wl,-rpath,/home/lb/compressor/SPERR/build/src \
   -std=c++17 -lSPERR
 ```
+
+`-I/home/lb/compressor/SPERR/build` 不能省略：该目录包含 CMake 生成的 `SperrConfig.h`，`pio_sperr.cpp` 会使用它与当前 `libSPERR.so` 的构建配置保持一致。
 
 `rpath` 让运行时能够找到 `libSPERR.so`。也可以不写 `-Wl,-rpath,...`，运行前改用：
 

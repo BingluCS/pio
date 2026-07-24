@@ -13,25 +13,21 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
-#include <exception>
 #include <vector>
 
-#include "SZ3/api/sz.hpp"
+#include "SPERR_C_API.h"
 #include "mpi.h"
 
 static int ensure_dir(const char* dir)
 {
     struct stat st;
     if (stat(dir, &st) == 0) {
-        if (S_ISDIR(st.st_mode))
-            return 0;
+        if (S_ISDIR(st.st_mode)) return 0;
         errno = ENOTDIR;
         return -1;
     }
-    if (mkdir(dir, 0777) == 0)
-        return 0;
-    if (errno == EEXIST)
-        return 0;
+    if (mkdir(dir, 0777) == 0) return 0;
+    if (errno == EEXIST) return 0;
     return -1;
 }
 
@@ -71,10 +67,7 @@ static unsigned char* readFloatData(const char *srcFilePath, size_t *nbEle)
 {
     size_t byteSize = 0;
     unsigned char *data = readBytes(srcFilePath, &byteSize);
-    if (data == NULL || byteSize % sizeof(float) != 0) {
-        free(data);
-        return NULL;
-    }
+    if (data == NULL) return NULL;
     *nbEle = byteSize / sizeof(float);
     return data;
 }
@@ -92,10 +85,121 @@ static double dataRange(const float *data, size_t nbEle)
     return static_cast<double>(maxVal - minVal);
 }
 
-void usage() {
-    printf("Test case: pio_sz3 -e error_bound -d dataset_name -i list_file -o output_dir -n nums [-z [parts]] [-1 r1 | -2 r1 r2 | -3 r1 r2 r3 | -4 r1 r2 r3 r4]\n");
-    printf("Example: pio_sz3 -e 1e-3 -d nyx -i /path/to/list.txt -o /path/to/out -n 4 -z 4 -3 r1 r2 r3\n");
+static const char* sperr_status_string(int status)
+{
+    switch (status) {
+        case 0: return "success";
+        case 1: return "output pointer must be NULL";
+        case 2: return "unsupported or invalid parameter";
+        case -1: return "internal SPERR error";
+        default: return "unknown SPERR error";
+    }
 }
+
+struct SperrVolume {
+    bool is3d;
+    size_t dimx;
+    size_t dimy;
+    size_t dimz;
+};
+
+static SperrVolume make_sperr_volume(size_t r1, size_t r2, size_t r3, size_t r4)
+{
+    SperrVolume volume;
+    volume.dimx = r1;
+    volume.dimy = r2;
+    volume.dimz = r3 * r4;
+    volume.is3d = (volume.dimz > 1);
+    if (!volume.is3d) {
+        volume.dimy = std::max<size_t>(volume.dimy, 1);
+        volume.dimz = 1;
+    }
+    return volume;
+}
+
+static size_t default_chunk(size_t dim)
+{
+    return std::min<size_t>(dim, 256);
+}
+
+static int sperr_compress_float(const float* data,
+                                const SperrVolume& volume,
+                                double absErrorBound,
+                                size_t sperr_threads,
+                                unsigned char** output,
+                                size_t* compressedSize)
+{
+    if (output == NULL || compressedSize == NULL) return 2;
+    *output = NULL;
+    *compressedSize = 0;
+    void* bytesOut = NULL;
+    size_t bytesOutSize = 0;
+    int status = 0;
+    if (volume.is3d) {
+        status = C_API::sperr_comp_3d(data, 1,
+                                      volume.dimx, volume.dimy, volume.dimz,
+                                      default_chunk(volume.dimx),
+                                      default_chunk(volume.dimy),
+                                      default_chunk(volume.dimz),
+                                      3, absErrorBound, sperr_threads,
+                                      &bytesOut, &bytesOutSize);
+    } else {
+        status = C_API::sperr_comp_2d(data, 1,
+                                      volume.dimx, volume.dimy,
+                                      3, absErrorBound, 0,
+                                      &bytesOut, &bytesOutSize);
+    }
+
+    if (status != 0 || bytesOut == NULL || bytesOutSize == 0) {
+        if (bytesOut != NULL) free(bytesOut);
+        return status == 0 ? -1 : status;
+    }
+
+    *output = static_cast<unsigned char*>(bytesOut);
+    *compressedSize = bytesOutSize;
+    return 0;
+}
+
+static int sperr_decompress_float(const unsigned char* input,
+                                  size_t inputSize,
+                                  const SperrVolume& volume,
+                                  size_t sperr_threads,
+                                  void** dataOut)
+{
+    if (dataOut == NULL) return 2;
+    *dataOut = NULL;
+    int status = 0;
+    if (volume.is3d) {
+        size_t dimx = 0;
+        size_t dimy = 0;
+        size_t dimz = 0;
+        status = C_API::sperr_decomp_3d(input, inputSize, 1, sperr_threads,
+                                        &dimx, &dimy, &dimz, dataOut);
+        if (status == 0 && (dimx != volume.dimx || dimy != volume.dimy || dimz != volume.dimz)) {
+            free(*dataOut);
+            *dataOut = NULL;
+            return 2;
+        }
+    } else {
+        status = C_API::sperr_decomp_2d(input, inputSize, 1,
+                                        volume.dimx, volume.dimy, dataOut);
+    }
+
+    if (status != 0 || *dataOut == NULL) {
+        if (*dataOut != NULL) free(*dataOut);
+        *dataOut = NULL;
+        return status == 0 ? -1 : status;
+    }
+    return 0;
+}
+
+static void usage()
+{
+    printf("Test case: pio_sperr -e error_bound -d dataset_name -i list_file -o output_dir -n nums [-z [parts]] [-t sperr_threads] [-1 r1 | -2 r1 r2 | -3 r1 r2 r3 | -4 r1 r2 r3 r4]\n");
+    printf("Example: pio_sperr -e 1e-3 -d nyx -i /path/to/list.txt -o /path/to/out -n 4 -z 4 -3 r1 r2 r3\n");
+    printf("Note: -e is treated as relative error; SPERR receives PWE = -e * data_range. -4 is compressed as 3D with dimz = r3 * r4.\n");
+}
+
 int main(int argc, char * argv[])
 {
     MPI_Init(&argc, &argv);
@@ -104,81 +208,156 @@ int main(int argc, char * argv[])
     int world_rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
+    srand(time(0));
     if(argc < 6)
     {
         if (world_rank == 0) usage();
         MPI_Finalize();
         return 0;
     }
+
     size_t r4 = 1;
     size_t r3 = 1;
     size_t r2 = 1;
     size_t r1 = 1;
 
     double eb = 1e-3;
-    const char *dataset_name = NULL;
-    const char *folder = NULL;
+    char *dataset_name = NULL;
+    char *folder = NULL;
     const char *output_dir = "./out";
     int num_vars = 0;
     bool split_z = false;
     size_t z_parts = 1;
+    size_t sperr_threads = 1;
 
     for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            if (world_rank == 0) usage();
+            MPI_Finalize();
+            return 1;
+        }
         switch (argv[i][1]) {
             case '1':
-                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1) usage();
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r2 = r3 = r4 = 1;
                 break;
             case '2':
-                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r2) != 1)
-                    usage();
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r3 = r4 = 1;
                 break;
             case '3':
-                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                    sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r3) != 1)
-                    usage();
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r3) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
+                r4 = 1;
                 break;
             case '4':
-                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                    sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r3) != 1 ||
-                    ++i == argc || sscanf(argv[i], "%zu", &r4) != 1)
-                    usage();
+                if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r2) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r3) != 1 ||
+                    ++i == argc || sscanf(argv[i], "%zu", &r4) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 break;
             case 'e':
-                if (++i == argc) usage();
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 eb = atof(argv[i]);
                 break;
             case 'i':
-                if (++i == argc) usage();
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 folder = argv[i];
                 break;
             case 'o':
-                if (++i == argc) usage();
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 output_dir = argv[i];
                 break;
             case 'n':
-                if (++i == argc || sscanf(argv[i], "%d", &num_vars) != 1) usage();
+                if (++i == argc || sscanf(argv[i], "%d", &num_vars) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 break;
             case 'd':
-                if (++i == argc) usage();
+                if (++i == argc) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
+                }
                 dataset_name = argv[i];
                 break;
             case 'z':
                 split_z = true;
                 z_parts = 2;
                 if (i + 1 < argc && argv[i + 1][0] != '-') {
-                    if (sscanf(argv[++i], "%zu", &z_parts) != 1) usage();
+                    if (sscanf(argv[++i], "%zu", &z_parts) != 1) {
+                        if (world_rank == 0) usage();
+                        MPI_Finalize();
+                        return 1;
+                    }
+                }
+                break;
+            case 't':
+                if (++i == argc || sscanf(argv[i], "%zu", &sperr_threads) != 1) {
+                    if (world_rank == 0) usage();
+                    MPI_Finalize();
+                    return 1;
                 }
                 break;
             default:
-                usage();
-                break;
+                if (world_rank == 0) usage();
+                MPI_Finalize();
+                return 1;
         }
     }
+
     if (dataset_name == NULL || folder == NULL || num_vars <= 0) {
         if (world_rank == 0) {
             printf("ERROR: Missing required arguments: -d (dataset_name), -i (list file), or -n (num_vars).\n");
             usage();
         }
+        MPI_Finalize();
+        return 1;
+    }
+    if (num_vars > 100) {
+        if (world_rank == 0) printf("ERROR: -n nums must be <= 100.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    if (eb <= 0.0) {
+        if (world_rank == 0) printf("ERROR: -e error_bound must be positive.\n");
+        MPI_Finalize();
+        return 1;
+    }
+    if (r1 == 0 || r2 == 0 || r3 == 0 || r4 == 0) {
+        if (world_rank == 0) printf("ERROR: all dimensions must be positive.\n");
         MPI_Finalize();
         return 1;
     }
@@ -195,40 +374,51 @@ int main(int argc, char * argv[])
         return 1;
     }
 
-
     std::string line;
     std::string input_dir;
-    char file[100][50];
+    std::vector<std::string> files;
     bool found_dataset = false;
-    int i = 0;
     while (std::getline(list_file, line)) {
         if (!found_dataset) {
-            if (strncasecmp(line.c_str(), dataset_name, strlen(dataset_name)) == 0) {
+            std::istringstream iss(line);
+            std::string name;
+            std::string dir;
+            iss >> name >> dir;
+            if (!name.empty() && strcasecmp(name.c_str(), dataset_name) == 0) {
                 found_dataset = true;
-                std::istringstream iss(line);
-                std::string dummy;
-                iss >> dummy >> input_dir;
+                input_dir = dir;
             }
         } else {
-            sscanf(line.c_str(), "%s", file[i]);
-            i++;
-            if (i >= num_vars) break;
+            std::istringstream iss(line);
+            std::string filename;
+            iss >> filename;
+            if (!filename.empty()) files.push_back(filename);
+            if (static_cast<int>(files.size()) >= num_vars) break;
         }
     }
     list_file.close();
 
+    if (!found_dataset || static_cast<int>(files.size()) < num_vars) {
+        if (world_rank == 0) {
+            printf("ERROR! Dataset %s was not found in %s or has fewer than %d listed variables.\n",
+                   dataset_name, folder, num_vars);
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
     if (world_rank == 0) printf("Start parallel compressing ... \n");
     if (world_rank == 0) printf("size: %d\n", world_size);
+    if (world_rank == 0) printf("SPERR OpenMP threads per MPI process: %zu\n", sperr_threads);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
     size_t compressed_size[100] = {0};
     size_t original_size[100] = {0};
+
     size_t total_original_size = 0;
     size_t total_size = 0;
     std::vector<unsigned char> compressed_output;
-
-    float *dataIn;
     const size_t active_parts = split_z ? z_parts : 1;
     if (num_vars * active_parts > 200) {
         if (world_rank == 0) printf("ERROR: num_vars * z parts must be <= 200.\n");
@@ -236,7 +426,9 @@ int main(int argc, char * argv[])
         return 1;
     }
     std::vector<size_t> part_compressed_size(num_vars * active_parts, 0);
-    std::vector<char*> part_output(num_vars * active_parts, NULL);
+    std::vector<unsigned char*> part_output(num_vars * active_parts, NULL);
+
+    float *dataIn;
     std::vector<size_t> z_offsets(active_parts + 1, 0);
     for (size_t p = 0; p <= active_parts; p++) {
         z_offsets[p] = split_z ? (r3 * p / active_parts) : (p == 0 ? 0 : r3);
@@ -247,26 +439,15 @@ int main(int argc, char * argv[])
         printf("\n");
     }
 
-    SZ3::Config conf(r4, r3, r2, r1);
-    conf.cmprAlgo = SZ3::ALGO_INTERP_LORENZO;
-    conf.relErrorBound = eb;
-    auto make_slab_conf = [&](size_t slab_z) {
-        SZ3::Config slab_conf = conf;
-        size_t slab_dims[4] = {r4, slab_z, r2, r1};
-        slab_conf.setDims(slab_dims, slab_dims + 4);
-        return slab_conf;
+    SperrVolume volume = make_sperr_volume(r1, r2, r3, r4);
+    auto make_slab_volume = [&](size_t slab_z) {
+        SperrVolume slab;
+        slab.is3d = true;
+        slab.dimx = r1;
+        slab.dimy = r2;
+        slab.dimz = slab_z;
+        return slab;
     };
-    size_t cmpBufferCap = SZ3::SZ_compress_size_bound<float>(conf);
-    if (split_z) {
-        cmpBufferCap = 0;
-        for (size_t p = 0; p < active_parts; p++) {
-            SZ3::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-            cmpBufferCap = std::max(cmpBufferCap, SZ3::SZ_compress_size_bound<float>(slab_conf));
-        }
-    }
-    for (size_t idx = 0; idx < part_output.size(); idx++) {
-        part_output[idx] = new char[cmpBufferCap];
-    }
 
     double start, end;
     double costReadOri = 0.0, costComp = 0.0;
@@ -280,7 +461,7 @@ int main(int argc, char * argv[])
     size_t nbEle;
     size_t expected_nbEle = r1 * r2 * r3 * r4;
     for(int i = 0; i < num_vars; i++) {
-        std::string filename = input_dir + "/" + file[i];
+        std::string filename = input_dir + "/" + files[i];
         if(world_rank == 0){
             start = MPI_Wtime();
             dataIn = reinterpret_cast<float*>(readFloatData(filename.c_str(), &nbEle));
@@ -318,17 +499,14 @@ int main(int argc, char * argv[])
         original_size[i] = nbEle * sizeof(float);
         total_original_size += original_size[i];
 
+        double absErrorBound = 0.0;
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0) start = MPI_Wtime();
-        double absErrorBound = 0.0;
         if(world_rank == 0) {
             absErrorBound = eb * dataRange(dataIn, nbEle);
             if (absErrorBound <= 0.0) absErrorBound = eb;
         }
         MPI_Bcast(&absErrorBound, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        conf.errorBoundMode = SZ3::EB_ABS;
-        conf.absErrorBound = absErrorBound;
-        conf.relErrorBound = eb;
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0){
             end = MPI_Wtime();
@@ -337,30 +515,23 @@ int main(int argc, char * argv[])
 
         if(world_rank == 0) start = MPI_Wtime();
         double localCompStart = MPI_Wtime();
-        try {
+        int status = 0;
+        if (split_z) {
+            const size_t xy = r1 * r2;
             compressed_size[i] = 0;
-            if (split_z) {
-                const size_t xy = r1 * r2;
-                for (size_t p = 0; p < active_parts; p++) {
-                    const size_t idx = i * active_parts + p;
-                    SZ3::Config slab_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-                    slab_conf.errorBoundMode = SZ3::EB_ABS;
-                    slab_conf.absErrorBound = absErrorBound;
-                    slab_conf.relErrorBound = eb;
-                    part_compressed_size[idx] = SZ_compress<float>(
-                        slab_conf, dataIn + z_offsets[p] * xy, part_output[idx], cmpBufferCap);
-                    compressed_size[i] += part_compressed_size[idx];
-                }
-            } else {
-                const size_t idx = i;
-                part_compressed_size[idx] = SZ_compress<float>(conf, dataIn, part_output[idx], cmpBufferCap);
-                compressed_size[i] = part_compressed_size[idx];
+            for (size_t p = 0; p < active_parts; p++) {
+                SperrVolume slab_volume = make_slab_volume(z_offsets[p + 1] - z_offsets[p]);
+                const size_t idx = i * active_parts + p;
+                status = sperr_compress_float(dataIn + z_offsets[p] * xy, slab_volume, absErrorBound,
+                                              sperr_threads, &part_output[idx], &part_compressed_size[idx]);
+                if (status != 0) break;
+                compressed_size[i] += part_compressed_size[idx];
             }
-        } catch (const std::exception &e) {
-            printf("ERROR! SZ3 compression failed on rank %d for %s with cmp buffer %.2f MiB: %s\n",
-                   world_rank, filename.c_str(), cmpBufferCap / 1048576.0, e.what());
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return 1;
+        } else {
+            const size_t idx = i;
+            status = sperr_compress_float(dataIn, volume, absErrorBound, sperr_threads,
+                                          &part_output[idx], &part_compressed_size[idx]);
+            compressed_size[i] = part_compressed_size[idx];
         }
         double localCompTime = MPI_Wtime() - localCompStart;
         localCompTotal += localCompTime;
@@ -377,8 +548,9 @@ int main(int argc, char * argv[])
         if(world_rank == 0) compAvg[i] = compSum / world_size;
         free(dataIn);
 
-        if (compressed_size[i] == 0) {
-            printf("SZ3 compression failed for %s\n", filename.c_str());
+        if (status != 0 || compressed_size[i] == 0) {
+            printf("SPERR compression failed on rank %d for %s: %s\n",
+                   world_rank, filename.c_str(), sperr_status_string(status));
             MPI_Abort(MPI_COMM_WORLD, 1);
             return 1;
         }
@@ -387,10 +559,9 @@ int main(int argc, char * argv[])
     }
 
     for (size_t idx = 0; idx < part_output.size(); idx++) {
-        compressed_output.insert(compressed_output.end(),
-                                 reinterpret_cast<unsigned char *>(part_output[idx]),
-                                 reinterpret_cast<unsigned char *>(part_output[idx]) + part_compressed_size[idx]);
-        delete[] part_output[idx];
+        compressed_output.insert(compressed_output.end(), part_output[idx],
+                                 part_output[idx] + part_compressed_size[idx]);
+        free(part_output[idx]);
     }
 
     char zip_filename[1024];
@@ -401,7 +572,7 @@ int main(int argc, char * argv[])
     }
 
     snprintf(zip_filename, sizeof(zip_filename), "%s/%s_%d_%d_%ld.out",
-             output_dir, "sz3", world_rank, (int)getpid(), (long)time(NULL));
+             output_dir, "sperr", world_rank, (int)getpid(), (long)time(NULL));
     MPI_Barrier(MPI_COMM_WORLD);
     if(world_rank == 0) start = MPI_Wtime();
     if (writeData(compressed_output.data(), compressed_output.size(), zip_filename) != 0) {
@@ -440,22 +611,23 @@ int main(int argc, char * argv[])
     }
 
     unsigned char *compressed_input_pos = compressed_input;
-    float *dataOutArr[200] = {nullptr};
+    void *dataOutArr[200] = {nullptr};
     for(int i = 0; i < num_vars; i++){
         MPI_Barrier(MPI_COMM_WORLD);
         if(world_rank == 0) start = MPI_Wtime();
+        int status = 0;
         if (split_z) {
             for (size_t p = 0; p < active_parts; p++) {
+                SperrVolume slab_volume = make_slab_volume(z_offsets[p + 1] - z_offsets[p]);
                 const size_t idx = i * active_parts + p;
-                SZ3::Config dec_conf = make_slab_conf(z_offsets[p + 1] - z_offsets[p]);
-                SZ_decompress<float>(dec_conf, reinterpret_cast<char*>(compressed_input_pos),
-                                     part_compressed_size[idx], dataOutArr[idx]);
+                status = sperr_decompress_float(compressed_input_pos, part_compressed_size[idx],
+                                                slab_volume, sperr_threads, &dataOutArr[idx]);
                 compressed_input_pos += part_compressed_size[idx];
+                if (status != 0) break;
             }
         } else {
-            SZ3::Config dec_conf = conf;
-            SZ_decompress<float>(dec_conf, reinterpret_cast<char*>(compressed_input_pos),
-                                 part_compressed_size[i], dataOutArr[i]);
+            status = sperr_decompress_float(compressed_input_pos, part_compressed_size[i],
+                                            volume, sperr_threads, &dataOutArr[i]);
             compressed_input_pos += part_compressed_size[i];
         }
         MPI_Barrier(MPI_COMM_WORLD);
@@ -463,8 +635,15 @@ int main(int argc, char * argv[])
             end = MPI_Wtime();
             costDecomp += end - start;
         }
+        if (status != 0) {
+            printf("SPERR decompression failed on rank %d for field %d: %s\n",
+                   world_rank, i, sperr_status_string(status));
+            free(compressed_input);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
+        }
     }
-    for (size_t idx = 0; idx < part_output.size(); idx++) delete[] dataOutArr[idx];
+    for (size_t idx = 0; idx < part_output.size(); idx++) free(dataOutArr[idx]);
     free(compressed_input);
 
     double totalCompMin = 0.0;
@@ -476,7 +655,7 @@ int main(int argc, char * argv[])
 
     if (world_rank == 0)
     {
-        printf("SZ3 Finish parallel compressing on %s, total compression ratio %.4g.\n", dataset_name, 1.0 * total_original_size / total_size);
+        printf("SPERR Finish parallel compressing on %s, total compression ratio %.4g.\n", dataset_name, 1.0 * total_original_size / total_size);
         printf("Separate ratios: ");
         for(int i = 0; i < num_vars; i++){
             printf("%.4g ", 1.0 * original_size[i] / compressed_size[i]);
@@ -489,7 +668,7 @@ int main(int argc, char * argv[])
                totalCompMin, totalCompMax, totalCompSum / world_size);
         printf("Local compression time per variable min/max/avg:\n");
         for(int i = 0; i < num_vars; i++){
-            printf("  %s: %.4f %.4f %.4f seconds\n", file[i], compMin[i], compMax[i], compAvg[i]);
+            printf("  %s: %.4f %.4f %.4f seconds\n", files[i].c_str(), compMin[i], compMax[i], compAvg[i]);
         }
         printf("Timecost of writing compressed files = %.4f seconds\n", costWriteZip);
         printf("Timecost of reading compressed files = %.4f seconds\n", costReadZip);

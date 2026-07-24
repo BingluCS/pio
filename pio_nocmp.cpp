@@ -1,8 +1,5 @@
 #include <stdio.h>
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,14 +15,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-#ifndef OMPI_SKIP_MPICXX
-#define OMPI_SKIP_MPICXX 1
-#endif
-
-#ifndef MPICH_SKIP_MPICXX
-#define MPICH_SKIP_MPICXX 1
-#endif
 
 #include "mpi.h"
 
@@ -347,12 +336,6 @@ int main(int argc, char *argv[])
                 MPI_Abort(MPI_COMM_WORLD, 1);
                 return 1;
             }
-#if defined(__linux__)
-            const uintptr_t page_base = reinterpret_cast<uintptr_t>(data_in) & ~static_cast<uintptr_t>(4095);
-            madvise(reinterpret_cast<void *>(page_base),
-                    num_elements * sizeof(float) + (reinterpret_cast<uintptr_t>(data_in) - page_base),
-                    MADV_HUGEPAGE);
-#endif
             MPI_Bcast(data_in, static_cast<int>(num_elements), MPI_FLOAT, 0, MPI_COMM_WORLD);
         }
 

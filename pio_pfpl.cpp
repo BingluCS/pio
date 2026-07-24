@@ -1,8 +1,5 @@
 #include <iostream>
 #include <stdio.h>
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,14 +14,6 @@
 #include <sstream>
 #include <algorithm>
 #include <vector>
-
-#ifndef OMPI_SKIP_MPICXX
-#define OMPI_SKIP_MPICXX 1
-#endif
-
-#ifndef MPICH_SKIP_MPICXX
-#define MPICH_SKIP_MPICXX 1
-#endif
 
 #include "pfpl_f32_noa_cpu_api.hpp"
 #include "mpi.h"
@@ -345,12 +334,6 @@ int main(int argc, char * argv[])
                 MPI_Abort(MPI_COMM_WORLD, 1);
                 return 1;
             }
-#if defined(__linux__)
-            uintptr_t pageBase = reinterpret_cast<uintptr_t>(dataIn) & ~static_cast<uintptr_t>(4095);
-            madvise(reinterpret_cast<void *>(pageBase),
-                    nbEle * sizeof(float) + (reinterpret_cast<uintptr_t>(dataIn) - pageBase),
-                    MADV_HUGEPAGE);
-#endif
             MPI_Bcast(dataIn, nbEle, MPI_FLOAT, 0, MPI_COMM_WORLD);
         }
         MPI_Barrier(MPI_COMM_WORLD);

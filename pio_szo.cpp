@@ -1,8 +1,5 @@
 #include <stdio.h>
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -19,14 +16,6 @@
 #include <algorithm>
 #include <exception>
 #include <vector>
-
-#ifndef OMPI_SKIP_MPICXX
-#define OMPI_SKIP_MPICXX 1
-#endif
-
-#ifndef MPICH_SKIP_MPICXX
-#define MPICH_SKIP_MPICXX 1
-#endif
 
 #include "SZo/api/sz.hpp"
 #include "mpi.h"
@@ -318,12 +307,6 @@ int main(int argc, char * argv[])
         else{
             MPI_Bcast(&nbEle, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
             dataIn = (float *) malloc(nbEle * sizeof(float));
-            #if defined(__linux__)
-            {   // hint THP for this large hot array (works under madvise mode; noop if unsupported)
-                uintptr_t _mb = (uintptr_t)(dataIn) & ~(uintptr_t)4095;
-                madvise((void *)_mb, (nbEle * sizeof(float)) + ((uintptr_t)(dataIn) - _mb), MADV_HUGEPAGE);
-            }
-            #endif
 
             if (dataIn == NULL) {
                 printf("ERROR! Failed to allocate input buffer on rank %d\n", world_rank);
@@ -461,14 +444,10 @@ int main(int argc, char * argv[])
     unsigned char *compressed_input_pos = compressed_input;
     float *dataOutArr[200] = {nullptr};   // keep every decompressed buffer; free them together AFTER the timed loop
 //     if (!split_z) {
-//         // pre-allocate + THP-hint + prefault the outputs OUTSIDE the timed loop, so the timed
+//         // pre-allocate and prefault the outputs OUTSIDE the timed loop, so the timed
 //         // decompress measures the kernel (buffer-reuse semantics), not page faults/compaction
 //         for (int i = 0; i < num_vars; i++) {
 //             dataOutArr[i] = new float[nbEle];
-// #if defined(__linux__)
-//             uintptr_t _mb = (uintptr_t)dataOutArr[i] & ~(uintptr_t)4095;
-//             madvise((void *)_mb, nbEle * sizeof(float) + ((uintptr_t)dataOutArr[i] - _mb), MADV_HUGEPAGE);
-// #endif
 //             memset(dataOutArr[i], 0, nbEle * sizeof(float));
 //         }
 //     }
