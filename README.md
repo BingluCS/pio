@@ -11,7 +11,6 @@
 | `pio_sperr` | SPERR | 有损，使用 point-wise error 模式 |
 | `pio_pfpl` | PFPL | 有损，float32 NOA 路径 |
 | `pio_zfp` | ZFP | 有损，accuracy 模式 |
-| `pio_zstd` | Zstd | 无损压缩 |
 | `pio_nocomp` | NoComp | 不压缩，只执行内存复制，用作基线 |
 
 ## Build
@@ -123,12 +122,6 @@ mpicxx -O3 pio_zfp.cpp -o pio_zfp \
   -std=c++17 -lzfp -fopenmp
 ```
 
-### Zstd
-
-```bash
-mpicxx -O3 pio_zstd.cpp -o pio_zstd -std=c++17 -lzstd
-```
-
 ### NoComp
 
 ```bash
@@ -160,7 +153,7 @@ Vf48.bin.f32
 
 ## Common Options
 
-除 `pio_zstd` 外，通用命令格式为：
+通用命令格式为：
 
 ```text
 mpirun -np PROCESSES ./PROGRAM \
@@ -170,7 +163,7 @@ mpirun -np PROCESSES ./PROGRAM \
 
 | 参数 | 含义 |
 | --- | --- |
-| `-e ERROR` | 相对误差参数；NoComp 忽略该值，Zstd 为兼容参数而忽略 |
+| `-e ERROR` | 相对误差参数；NoComp 忽略该值 |
 | `-d DATASET` | `list.txt` 中的数据集名称，不区分大小写 |
 | `-i LIST` | 数据集列表文件路径 |
 | `-o OUTPUT_DIR` | 每个 rank 写入压缩文件的目录 |
@@ -223,14 +216,6 @@ OMP_NUM_THREADS=1 mpirun -np 8 ./pio_sperr \
   -n 6 -t 1 -3 512 512 512
 ```
 
-Zstd 使用 `-l` 指定压缩级别，不使用 `-z`：
-
-```bash
-mpirun -np 8 ./pio_zstd \
-  -d NYX -i list.txt -o /data0/lb/pio-output \
-  -n 6 -l 3 -3 512 512 512
-```
-
 NoComp 基线：
 
 ```bash
@@ -259,7 +244,7 @@ absolute_error_bound = ERROR * (max(data) - min(data))
 
 然后将同一个绝对误差界广播给所有 rank。使用 `-z` 时，各 slab 仍使用整个变量的 range 所得到的误差界，保证切分前后的误差参数一致。
 
-Zstd 是无损压缩；NoComp 只复制原始字节。
+NoComp 只复制原始字节。
 
 ## Timing Output
 
