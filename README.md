@@ -11,6 +11,7 @@
 | `pio_sperr` | SPERR | 有损，使用 point-wise error 模式 |
 | `pio_pfpl` | PFPL | 有损，float32 NOA 路径 |
 | `pio_zfp` | ZFP | 有损，accuracy 模式 |
+| `pio_zstd` | Zstd | 无损压缩 |
 | `pio_nocomp` | NoComp | 不压缩，只执行内存复制，用作基线 |
 
 ## Build
@@ -31,6 +32,50 @@ mpicxx -O3 pio_szo.cpp -o pio_szo \
 ```
 
 SZo 的 RLE+FSE 后端使用 `libzstd` 中的 FSE 符号，因此必须保留 `-lzstd`。如果链接时出现 `undefined reference to FSE_*`，应确认系统的 `libzstd-dev` 可用，并把 `-lzstd` 放在源文件/目标文件之后。
+
+#### SZo on ARM with SVE2
+
+当前 SZo 的 ARM SIMD 路径由编译器宏 `__ARM_FEATURE_SVE2` 控制，实际要求 **SVE2**，不是只有第一代 SVE。先在 ARM 机器上启用 SVE2 构建 SZo：
+
+```bash
+cd /home/lb/compressor/SZo
+cmake -S . -B build -DENABLE_SVE2=ON
+cmake --build build -j
+```
+
+然后编译 PIO 程序：
+
+```bash
+cd /home/lb/compressor/pio
+mpicxx -O3 pio_szo.cpp -o pio_szo \
+  -I/home/lb/compressor/SZo/build/include \
+  -L/home/lb/compressor/SZo/build/lib64 \
+  -std=c++17 -lzstd -march=armv8.6-a+sve2
+```
+
+ARM 构建不要使用 x86 专用的 `-mavx2 -mfma`。如果程序只在编译它的同一台机器上运行，也可以让编译器按本机 CPU 自动选择指令集：
+
+```bash
+mpicxx -O3 pio_szo.cpp -o pio_szo \
+  -I/home/lb/compressor/SZo/build/include \
+  -L/home/lb/compressor/SZo/build/lib64 \
+  -std=c++17 -lzstd -march=native
+```
+
+只有当本机 CPU 支持 SVE2 时，`-march=native` 才会定义 `__ARM_FEATURE_SVE2` 并启用 SZo 的 SVE2 代码。可以检查编译器是否启用了该宏：
+
+```bash
+echo | mpicxx -march=armv8.6-a+sve2 -dM -E -x c++ - | grep __ARM_FEATURE_SVE
+```
+
+预期至少包含：
+
+```text
+#define __ARM_FEATURE_SVE 1
+#define __ARM_FEATURE_SVE2 1
+```
+
+如果 ARM CPU 只支持 SVE、不支持 SVE2（例如部分 A64FX 环境），当前 SZo 不会启用这条 SIMD 路径，需要使用 scalar 构建或另行实现 SVE-only 路径。用 SVE2 参数生成的可执行文件也只能在支持 SVE2 的 CPU 上运行，否则会触发 illegal instruction。
 
 ### SZ3
 
@@ -76,6 +121,11 @@ mpicxx -O3 pio_zfp.cpp -o pio_zfp \
   -std=c++17 -lzfp -fopenmp
 ```
 
+### Zstd
+
+```bash
+mpicxx -O3 pio_zstd.cpp -o pio_zstd -std=c++17 -lzstd
+```
 
 ### NoComp
 
@@ -171,13 +221,13 @@ OMP_NUM_THREADS=1 mpirun -np 8 ./pio_sperr \
   -n 6 -t 1 -3 512 512 512
 ```
 
-<!-- Zstd 使用 `-l` 指定压缩级别，不使用 `-z`：
+Zstd 使用 `-l` 指定压缩级别，不使用 `-z`：
 
 ```bash
 mpirun -np 8 ./pio_zstd \
   -d NYX -i list.txt -o /data0/lb/pio-output \
   -n 6 -l 3 -3 512 512 512
-``` -->
+```
 
 NoComp 基线：
 
