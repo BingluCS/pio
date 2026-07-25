@@ -1,4 +1,80 @@
-# Parallel I/O Compression Benchmarks
+# Parallel I/O Compression Benchmarks - NUMA-local Broadcast
+
+本目录是原始 `pio` 程序的多节点、多 NUMA 版本。原目录源码保持不变。
+
+## NUMA-local Input Replication
+
+每个程序保持“每个 MPI rank 都压缩和解压一份完整数据”的实验语义，但不再由
+全局 rank 0 向 `MPI_COMM_WORLD` 广播大数组。新的输入路径为：
+
+1. 使用 `MPI_Comm_split_type(..., MPI_COMM_TYPE_SHARED, ...)` 创建单节点通信器；
+2. 从 rank 的 CPU affinity 和 Linux sysfs 自动确定其 NUMA domain；
+3. 在节点通信器内部按 NUMA ID 创建 `numa_comm`；
+4. 每个 `numa_comm` 的本地 rank 0 独立读取一份完整输入；
+5. 只在该 `numa_comm` 内广播数据大小和完整输入；
+6. 每个 rank 继续独立执行压缩、写入、读取和解压缩。
+
+NUMA 内的 rank 数量完全由实际 CPU 绑定决定，不要求每个 NUMA 固定为 16 个
+rank。启动时每个 NUMA leader 会输出一行映射信息：
+
+```text
+PIO_NUMA_GROUP host=cn00001 numa=3 ranks=16 leader_world_rank=48 leader_cpu=114
+```
+
+如果一个 rank 的 CPU affinity 跨越多个 NUMA domain，程序会立即终止，避免
+静默创建错误的 NUMA 通信器。
+
+输入浮点数组使用分块 `MPI_Bcast`，因此也支持元素数量超过单次 MPI `int`
+count 上限的数据。
+
+## Required launch form
+
+CPU 绑定仍由 HMPI rankfile 负责。`numactl --localalloc` 必须放在 `mpirun`
+的应用程序位置，使它分别作用于每个 MPI rank：
+
+```bash
+export OMP_NUM_THREADS=1
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+export OMP_DYNAMIC=false
+
+mpirun \
+  -np "${CCS_TASK_REPLICA}" \
+  --rankfile "$RANKFILE" \
+  --mca rmaps_rank_file_physical true \
+  --mca plm_rsh_agent /usr/bin/ssh \
+  -x PATH \
+  -x LD_LIBRARY_PATH \
+  -x OMP_NUM_THREADS \
+  -x OMP_PROC_BIND \
+  -x OMP_PLACES \
+  -x OMP_DYNAMIC \
+  numactl --localalloc \
+  ./pio_szo \
+  -e 1e-3 -d NYX -i list.txt -o /path/to/output \
+  -n 6 -3 512 512 512
+```
+
+不要写成：
+
+```bash
+numactl --localalloc mpirun ...
+```
+
+后一种写法只对 MPI 启动器设置策略，不能清晰保证每个远端 rank 都分别执行
+`numactl --localalloc`。
+
+编译时 `numa_local_bcast.hpp` 必须与 `.cpp` 文件位于同一目录。该实现通过
+`/sys/devices/system/cpu/` 获取 NUMA ID，不需要链接 `libnuma`。在 Linux
+上建议给原编译命令增加：
+
+```text
+-D_GNU_SOURCE
+```
+
+下面保留了原项目的编译说明。在服务器上使用这些命令时，请进入新的
+`pio_mn` 目录（而不是原来的 `pio` 目录），并把 `-D_GNU_SOURCE` 加到每条
+`mpicxx` 命令中；其余压缩器参数和链接参数保持不变。
 
 该目录包含一组 MPI 并发压缩测试程序。它们使用相同的数据列表、命令行参数和计时流程，便于比较不同压缩器在单进程和多进程并发下的压缩率与性能。
 
